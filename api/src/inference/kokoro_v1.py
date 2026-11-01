@@ -87,6 +87,18 @@ def _espeak_word_timestamps(graphemes, phonemes, pred_dur, g2p=None):
         return None
 
 
+def _bake_weight_norm(model: torch.nn.Module) -> None:
+    """Fold kokoro's weight-normalised layers into plain weights.
+
+    Weight norm only matters for training; at inference it recomputes every
+    conv's weight on each call and keeps three copies of it. Folding saves
+    ~220 MB on CPU and the per-call recompute, with identical output.
+    """
+    for module in model.modules():
+        if hasattr(module, "weight_g"):
+            torch.nn.utils.remove_weight_norm(module)
+
+
 def _configure_rocm_backend() -> None:
     """Disable MIOpen on ROCm.
 
@@ -185,6 +197,7 @@ class KokoroV1(BaseModelBackend):
             self._model = KModel(
                 repo_id=settings.model_repo_id, config=config_path, model=model_path
             ).eval()
+            _bake_weight_norm(self._model)
             # For MPS, manually move ISTFT layers to CPU while keeping rest on MPS
             if self._device == "mps":
                 logger.info(
