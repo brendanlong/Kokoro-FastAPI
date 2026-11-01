@@ -92,6 +92,8 @@ conflicts = [
 ]
 override-dependencies = [
     "triton>=3.5.1 ; platform_machine == 'aarch64'",
+    # An override replaces every requirement on the package, so without this x86 gets no triton (torch.compile needs it)
+    "triton==3.4.0 ; platform_machine == 'x86_64' and sys_platform == 'linux'",
     "pyopenjtalk ; sys_platform != 'win32'",
 ]
 
