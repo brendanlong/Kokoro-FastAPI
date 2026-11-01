@@ -63,9 +63,9 @@ class Settings(BaseSettings):
     # Audio Settings
     default_volume_multiplier: float = 1.0
     # Text Processing Settings
-    target_min_tokens: int = 175  # Target minimum tokens per chunk
-    target_max_tokens: int = 250  # Target maximum tokens per chunk
-    absolute_max_tokens: int = 450  # Absolute maximum tokens per chunk
+    absolute_max_tokens: int = (
+        450  # Phonemes per chunk; a longer sentence is split, model limit is 510
+    )
     ssml_max_depth: int = (
         10  # Deepest SSML element nesting translated, real documents sit at 2-5
     )

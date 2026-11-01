@@ -11,6 +11,7 @@ from loguru import logger
 from ..core import paths
 from ..core.config import settings
 from ..core.model_config import ModelConfig, model_config
+from . import g2p
 from .base import BaseModelBackend
 from .kokoro_v1 import KokoroV1
 
@@ -87,7 +88,11 @@ class ModelManager:
                 # Use default voice name for warmup
                 voice_name = settings.default_voice
                 logger.debug(f"Using default voice '{voice_name}' for warmup")
-                async for _ in self.generate(warmup_text, (voice_name, voice_path)):
+                lang_code = settings.default_voice_code or voice_name[0].lower()
+                phonemes = await asyncio.to_thread(
+                    g2p.phonemize, warmup_text, lang_code
+                )
+                async for _ in self.generate(phonemes, (voice_name, voice_path)):
                     pass
             except Exception as e:
                 raise RuntimeError(f"Failed to get default voice: {e}")

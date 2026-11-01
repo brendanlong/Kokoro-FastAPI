@@ -115,9 +115,7 @@ Names are the field names from `api/src/core/config.py`, uppercased. Unrecognize
 
 | Variable | Default | |
 |---|---|---|
-| `TARGET_MIN_TOKENS` | `175` | Chunker aims for at least this many tokens |
-| `TARGET_MAX_TOKENS` | `250` | Chunker aims for at most this many |
-| `ABSOLUTE_MAX_TOKENS` | `450` | Hard ceiling per chunk, model limit is 510 |
+| `ABSOLUTE_MAX_TOKENS` | `450` | Phonemes per chunk (one sentence per chunk); a longer sentence is split, model limit is 510 |
 | `ENABLE_SSML` | `true` | Kill switch for SSML translation, the `/dev/ssml` routes and `ssml: true` on the speech endpoints will 403 when off |
 | `SSML_MAX_DEPTH` | `10` | Deepest SSML nesting translated, past it is a 400 |
 | `MAX_PAUSE_DURATION_S` | `60.0` | Ceiling for a single `[pause:Ns]` tag or SSML `<break>`, longer values are clamped |

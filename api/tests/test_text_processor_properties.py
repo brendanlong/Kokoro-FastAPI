@@ -2,8 +2,9 @@
 
 test_text_processor.py pins exact outputs for known inputs. These pin what
 must hold for any input: line joining and voice splitting keep every word in
-order, and the packer only ever moves whitespace between the sentences it is
-given. Token counts are faked so no phonemizer runs.
+order, the chunker only ever moves whitespace and never joins sentences, and the
+packer for oversized sentences fills to its cap. Phonemes are faked as one per
+character, so no G2P runs.
 """
 
 import asyncio
@@ -17,6 +18,7 @@ from hypothesis import (
 )
 from unicode_segmentation_rs import unicode_sentences
 
+from api.src.inference.g2p import Phonemes
 from api.src.services.text_processing import text_processor
 from api.src.services.text_processing.text_processor import (
     join_lines,
@@ -44,7 +46,7 @@ tag = st.sampled_from(
 gap = st.sampled_from(["", " ", "\n\n"])
 word = st.from_regex(r"\A[a-z]{1,8}[.,]?\Z")
 pieces = st.lists(st.integers(min_value=1, max_value=12), max_size=20).map(
-    lambda sizes: [(f"p{i}", [i] * n) for i, n in enumerate(sizes)]
+    lambda sizes: [Phonemes(f"p{i}", "x" * n) for i, n in enumerate(sizes)]
 )
 tagged_parts = st.lists(st.tuples(tag, gap, word, gap), min_size=1, max_size=8)
 
@@ -57,26 +59,22 @@ def squash(text: str) -> str:
     return "".join(text.split())
 
 
-def chunks_of(
-    text: str, target_max: int, max_tokens: int = 1000
-) -> list[tuple[str, list[int]]]:
+def fake_phonemize(text: str, lang_code: str) -> Phonemes:
+    return Phonemes(text, text.strip())
+
+
+def chunks_of(text: str, max_tokens: int = 1000) -> list[tuple[str, str]]:
     async def collect():
         return [
-            (chunk, tokens)
-            async for chunk, tokens, pause in smart_split(
+            (chunk, phonemes.phonemes)
+            async for chunk, phonemes, pause in smart_split(
                 text, max_tokens, normalization_options=RAW
             )
             if pause is None
         ]
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(
-            text_processor,
-            "process_text_chunk",
-            lambda text, *args, **kwargs: [0] * len(text.strip()),
-        )
-        patch.setattr(text_processor.settings, "target_min_tokens", target_max // 2)
-        patch.setattr(text_processor.settings, "target_max_tokens", target_max)
+        patch.setattr(text_processor, "phonemize", fake_phonemize)
         return asyncio.run(collect())
 
 
@@ -120,56 +118,54 @@ def test_split_by_voice_returns_untagged_text_whole(text):
     assert split_by_voice(text, "af_heart") == [("af_heart", 1.0, text)]
 
 
-@given(st.one_of(any_text, lines), st.integers(min_value=3, max_value=20))
-def test_smart_split_only_moves_whitespace(text, target_max):
+@given(st.one_of(any_text, lines))
+def test_smart_split_only_moves_whitespace(text):
     assume("[pause" not in text.lower())
-    chunks = [chunk for chunk, _ in chunks_of(text, target_max)]
+    chunks = [chunk for chunk, _ in chunks_of(text)]
     assert all(chunk and chunk == chunk.strip() for chunk in chunks)
     sentences = unicode_sentences(join_lines(text))
     assert squash(" ".join(chunks)) == squash("".join(sentences))
 
 
-@given(
-    runs, st.integers(min_value=3, max_value=20), st.integers(min_value=3, max_value=40)
-)
-def test_smart_split_honours_token_cap(text, target_max, max_tokens):
-    chunks = chunks_of(text, target_max, max_tokens)
-    assert words(" ".join(chunk for chunk, _ in chunks)) == words(text)
-    assert all(
-        len(tokens) <= max_tokens or " " not in chunk for chunk, tokens in chunks
-    )
+@given(runs, st.integers(min_value=3, max_value=40))
+def test_smart_split_honours_token_cap(text, max_tokens):
+    chunks = chunks_of(text, max_tokens)
+    # a word longer than the cap is cut too, and line joining adds periods: compare letters
+    letters = lambda t: re.sub(r"[^ab]", "", t)
+    assert letters(" ".join(chunk for chunk, _ in chunks)) == letters(text)
+    assert all(len(phonemes) <= max_tokens for _, phonemes in chunks)
 
 
-@given(
-    pieces,
-    st.integers(min_value=1, max_value=20),
-    st.integers(min_value=0, max_value=20),
-    st.integers(min_value=1, max_value=30),
-)
-def test_pack_keeps_every_piece_in_order(pieces, max_tokens, min_tokens, target_max):
-    chunks = list(pack(pieces, max_tokens, min_tokens, target_max))
-    assert [t for _, tokens in chunks for t in tokens] == [
-        t for _, tokens in pieces for t in tokens
-    ]
-    assert " ".join(text for text, _ in chunks).split() == [text for text, _ in pieces]
-    assert all(text and tokens for text, tokens in chunks)
+@given(st.one_of(any_text, lines))
+def test_smart_split_never_joins_sentences(text):
+    assume("[pause" not in text.lower())
+    sentences = [s.strip() for s in unicode_sentences(join_lines(text)) if s.strip()]
+    assert [chunk for chunk, _ in chunks_of(text)] == sentences
 
 
-@given(
-    pieces,
-    st.integers(min_value=1, max_value=20),
-    st.integers(min_value=0, max_value=20),
-    st.integers(min_value=1, max_value=30),
-)
-def test_pack_is_greedy_under_the_caps(pieces, max_tokens, min_tokens, target_max):
-    """A chunk only closes when the next piece would not fit, and never passes max_tokens unless it is one piece."""
-    chunks = list(pack(pieces, max_tokens, min_tokens, target_max))
-    cap = min(target_max, max_tokens)
-    assert all(
-        len(tokens) <= max_tokens or len(set(tokens)) == 1 for _, tokens in chunks
-    )
-    for (_, tokens), (_, following) in zip(chunks, chunks[1:]):
-        first_next = len(pieces[following[0]][1])
-        total = len(tokens) + first_next
-        assert total > cap
-        assert total > max_tokens or len(tokens) >= min_tokens
+def pack_fake(pieces, max_tokens):
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            text_processor,
+            "phonemize",
+            lambda text, lang: Phonemes(text, "x" * len(text)),
+        )
+        return list(pack(pieces, max_tokens, "a"))
+
+
+@given(pieces, st.integers(min_value=1, max_value=30))
+def test_pack_keeps_every_piece_in_order(pieces, max_tokens):
+    chunks = pack_fake(pieces, max_tokens)
+    assert " ".join(c.text for c in chunks).split() == [p.text for p in pieces]
+    assert all(c.text and c.phonemes for c in chunks)
+
+
+@given(pieces, st.integers(min_value=1, max_value=30))
+def test_pack_is_greedy_under_the_cap(pieces, max_tokens):
+    """A group closes only when the next piece would not fit; it passes the cap only as one piece."""
+    sizes = {p.text: len(p.phonemes) for p in pieces}
+    groups = [c.text.split() for c in pack_fake(pieces, max_tokens)]
+    totals = [sum(sizes[t] for t in g) + len(g) - 1 for g in groups]
+    assert all(total <= max_tokens or len(g) == 1 for total, g in zip(totals, groups))
+    for total, following in zip(totals, groups[1:]):
+        assert total + 1 + sizes[following[0]] > max_tokens

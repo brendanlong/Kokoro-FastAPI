@@ -502,28 +502,22 @@ def test_phonemize_empty_text_is_400():
 
 
 def test_phonemize_returns_phonemes():
-    mock_pipeline = MagicMock(
-        return_value=iter([MagicMock(phonemes="hˈɛlO", tokens=[])])
-    )
-    with patch("api.src.routers.development.KPipeline", return_value=mock_pipeline):
-        response = client.post("/dev/phonemize", json={"text": "hello"})
+    """Same G2P generation uses, so what this returns is what the model is fed."""
+    response = client.post("/dev/phonemize", json={"text": "hello", "language": "a"})
     assert response.status_code == 200
-    assert response.json()["phonemes"] == "hˈɛlO"
+    assert response.json()["phonemes"] == "həlˈO"
 
 
-def test_phonemize_returns_every_segment():
-    mock_pipeline = MagicMock(
-        return_value=iter(
-            [
-                MagicMock(phonemes="hˈɛlO", tokens=[]),
-                MagicMock(phonemes="wˈɜɹld", tokens=[]),
-            ]
-        )
-    )
-    with patch("api.src.routers.development.KPipeline", return_value=mock_pipeline):
-        response = client.post("/dev/phonemize", json={"text": "hello\n\nworld"})
+def test_phonemize_uses_the_requested_language():
+    from api.src.inference.g2p import Phonemes
+
+    with patch(
+        "api.src.inference.g2p.phonemize", return_value=Phonemes("hola", "ˈola")
+    ) as phonemize:
+        response = client.post("/dev/phonemize", json={"text": "hola", "language": "e"})
     assert response.status_code == 200
-    assert response.json()["phonemes"] == "hˈɛlO wˈɜɹld"
+    assert response.json()["phonemes"] == "ˈola"
+    phonemize.assert_called_once_with("hola", "e")
 
 
 def test_openai_speech_pcm_streaming(mock_tts_service, test_voice, mock_audio_bytes):
