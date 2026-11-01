@@ -1,6 +1,8 @@
 """Tests for AudioService"""
 
+import asyncio
 import io
+import time
 from unittest.mock import patch
 
 import av
@@ -8,7 +10,7 @@ import numpy as np
 import pytest
 
 from api.src.inference.base import AudioChunk
-from api.src.services.audio import AudioService
+from api.src.services.audio import AudioNormalizer, AudioService
 from api.src.services.streaming_audio_writer import StreamingAudioWriter
 
 
@@ -239,3 +241,53 @@ def test_finalize_preserves_tail(format):
     else:
         # lossy encoders pad with encoder delay, but must not truncate
         assert decoded >= 2 * len(audio)
+
+
+def test_trim_keeps_the_sound_and_pads_its_edges(mock_settings):
+    mock_settings.dynamic_gap_trim_padding_ms = 410
+    mock_settings.dynamic_gap_trim_padding_char_multiplier = {".": 1}
+    rate = 24000
+    tone = (np.sin(np.arange(rate // 5) / 5) * 20000).astype(np.int16)
+    silence = np.zeros(rate // 2, np.int16)
+    audio = np.concatenate([silence, tone, silence])
+
+    normalizer = AudioNormalizer()
+    start, end = normalizer.find_first_last_non_silent(audio, "Hi.", 1.0)
+
+    loud = np.flatnonzero(np.abs(audio.astype(np.int32)) > 32767 * 10 ** (-45 / 20))
+    assert start == loud[0] - normalizer.samples_to_pad_start
+    assert end == loud[-1] + int(0.41 * rate) - normalizer.samples_to_pad_start
+
+
+def test_trim_leaves_all_silent_audio_alone(mock_settings):
+    mock_settings.dynamic_gap_trim_padding_ms = 410
+    mock_settings.dynamic_gap_trim_padding_char_multiplier = {}
+    audio = np.zeros(4800, np.int16)
+    assert AudioNormalizer().find_first_last_non_silent(audio, "", 1.0) == (0, 4800)
+
+
+@pytest.mark.asyncio
+async def test_convert_audio_does_not_block_the_event_loop(sample_audio, monkeypatch):
+    """Encoding runs in a thread, so other requests keep being served meanwhile."""
+    audio_data, sample_rate = sample_audio
+    writer = StreamingAudioWriter("pcm", sample_rate=sample_rate)
+
+    def slow_write(*args, **kwargs):
+        time.sleep(0.3)
+        return b"x"
+
+    monkeypatch.setattr(writer, "write_chunk", slow_write)
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    task = asyncio.create_task(ticker())
+    await AudioService.convert_audio(
+        AudioChunk(audio_data), "pcm", writer, trim_audio=False
+    )
+    task.cancel()
+    assert ticks >= 10

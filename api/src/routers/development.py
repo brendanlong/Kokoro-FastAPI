@@ -1,3 +1,4 @@
+import asyncio
 import base64
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -118,12 +119,16 @@ async def generate_from_phonemes(
                     # Normalize audio before writing
                     normalized_audio = normalizer.normalize(chunk_audio)
                     # Write chunk and yield bytes
-                    chunk_bytes = writer.write_chunk(normalized_audio)
+                    chunk_bytes = await asyncio.to_thread(
+                        writer.write_chunk, normalized_audio
+                    )
                     if chunk_bytes:
                         yield chunk_bytes
 
                     # Finalize and yield remaining bytes
-                    final_bytes = writer.write_chunk(finalize=True)
+                    final_bytes = await asyncio.to_thread(
+                        writer.write_chunk, finalize=True
+                    )
                     if final_bytes:
                         yield final_bytes
                 else:

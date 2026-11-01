@@ -1,5 +1,6 @@
 """Audio conversion service"""
 
+import asyncio
 import math
 
 import numpy as np
@@ -68,22 +69,10 @@ class AudioNormalizer:
         amplitude_threshold = np.iinfo(audio_data.dtype).max * (
             10 ** (silence_threshold_db / 20)
         )
-        # Find the first samples above the silence threshold at the start and end of the audio
-        non_silent_index_start, non_silent_index_end = None, None
-
-        for X in range(0, len(audio_data)):
-            if abs(int(audio_data[X])) > amplitude_threshold:
-                non_silent_index_start = X
-                break
-
-        for X in range(len(audio_data) - 1, -1, -1):
-            if abs(int(audio_data[X])) > amplitude_threshold:
-                non_silent_index_end = X
-                break
-
-        # Handle the case where the entire audio is silent
-        if non_silent_index_start == None or non_silent_index_end == None:
+        loud = np.flatnonzero(np.abs(audio_data.astype(np.int32)) > amplitude_threshold)
+        if len(loud) == 0:
             return 0, len(audio_data)
+        non_silent_index_start, non_silent_index_end = loud[0], loud[-1]
 
         return max(non_silent_index_start - self.samples_to_pad_start, 0), min(
             non_silent_index_end + math.ceil(samples_to_pad_end / speed),
@@ -163,28 +152,50 @@ class AudioService:
             if normalizer is None:
                 normalizer = AudioNormalizer()
 
-            audio_chunk.audio = normalizer.normalize(audio_chunk.audio)
-
-            if trim_audio == True:
-                audio_chunk = AudioService.trim_audio(
-                    audio_chunk, chunk_text, speed, is_last_chunk, normalizer
-                )
-
-            chunk_data = b""
-            if len(audio_chunk.audio) > 0:
-                chunk_data = writer.write_chunk(audio_chunk.audio)
-
-            if is_last_chunk:
-                chunk_data += writer.write_chunk(finalize=True)
-
-            audio_chunk.output = chunk_data
-            return audio_chunk
+            # Trimming and encoding are CPU-bound; a thread keeps other requests served meanwhile
+            return await asyncio.to_thread(
+                AudioService._trim_and_encode,
+                audio_chunk,
+                writer,
+                speed,
+                chunk_text,
+                is_last_chunk,
+                trim_audio,
+                normalizer,
+            )
 
         except Exception as e:
             logger.error(f"Error converting audio stream to {output_format}: {str(e)}")
             raise ValueError(
                 f"Failed to convert audio stream to {output_format}: {str(e)}"
             )
+
+    @staticmethod
+    def _trim_and_encode(
+        audio_chunk: AudioChunk,
+        writer: StreamingAudioWriter,
+        speed: float,
+        chunk_text: str,
+        is_last_chunk: bool,
+        trim_audio: bool,
+        normalizer: AudioNormalizer,
+    ) -> AudioChunk:
+        audio_chunk.audio = normalizer.normalize(audio_chunk.audio)
+
+        if trim_audio:
+            audio_chunk = AudioService.trim_audio(
+                audio_chunk, chunk_text, speed, is_last_chunk, normalizer
+            )
+
+        chunk_data = b""
+        if len(audio_chunk.audio) > 0:
+            chunk_data = writer.write_chunk(audio_chunk.audio)
+
+        if is_last_chunk:
+            chunk_data += writer.write_chunk(finalize=True)
+
+        audio_chunk.output = chunk_data
+        return audio_chunk
 
     @staticmethod
     def trim_audio(
