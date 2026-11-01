@@ -2,7 +2,7 @@
 
 import asyncio
 import io
-import time
+import threading
 from unittest.mock import patch
 
 import av
@@ -266,28 +266,72 @@ def test_trim_leaves_all_silent_audio_alone(mock_settings):
     assert AudioNormalizer().find_first_last_non_silent(audio, "", 1.0) == (0, 4800)
 
 
-@pytest.mark.asyncio
-async def test_convert_audio_does_not_block_the_event_loop(sample_audio, monkeypatch):
-    """Encoding runs in a thread, so other requests keep being served meanwhile."""
-    audio_data, sample_rate = sample_audio
+def _blocking_writer(sample_rate):
+    """A writer whose write_chunk parks in its thread until released, recording when it finishes."""
     writer = StreamingAudioWriter("pcm", sample_rate=sample_rate)
+    started, release, events = threading.Event(), threading.Event(), []
 
-    def slow_write(*args, **kwargs):
-        time.sleep(0.3)
+    def write_chunk(*args, **kwargs):
+        started.set()
+        release.wait(5)
+        events.append("write finished")
         return b"x"
 
-    monkeypatch.setattr(writer, "write_chunk", slow_write)
-    ticks = 0
+    writer.write_chunk = write_chunk
+    return writer, started, release, events
 
-    async def ticker():
-        nonlocal ticks
-        while True:
-            await asyncio.sleep(0.01)
-            ticks += 1
 
-    task = asyncio.create_task(ticker())
-    await AudioService.convert_audio(
-        AudioChunk(audio_data), "pcm", writer, trim_audio=False
+@pytest.mark.asyncio
+async def test_convert_audio_does_not_block_the_event_loop(sample_audio):
+    """Encoding runs in a thread, so other requests keep being served meanwhile."""
+    audio_data, sample_rate = sample_audio
+    writer, started, release, _ = _blocking_writer(sample_rate)
+
+    task = asyncio.create_task(
+        AudioService.convert_audio(
+            AudioChunk(audio_data), "pcm", writer, trim_audio=False
+        )
     )
+    await asyncio.to_thread(started.wait, 5)
+    # The encode is parked in its thread; this coroutine still gets to run.
+    assert not task.done()
+    release.set()
+    assert (await task).output == b"x"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_convert_audio_waits_for_its_encode(sample_audio):
+    """A disconnect cancels the request, which then closes the writer: that must not happen mid-write."""
+    audio_data, sample_rate = sample_audio
+    writer, started, release, events = _blocking_writer(sample_rate)
+
+    async def request():
+        try:
+            await AudioService.convert_audio(
+                AudioChunk(audio_data), "pcm", writer, trim_audio=False
+            )
+        finally:
+            events.append("writer closed")
+
+    task = asyncio.create_task(request())
+    await asyncio.to_thread(started.wait, 5)
     task.cancel()
-    assert ticks >= 10
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == ["write finished", "writer closed"]
+
+
+def test_trim_handles_the_most_negative_sample(mock_settings):
+    mock_settings.dynamic_gap_trim_padding_ms = 0
+    mock_settings.dynamic_gap_trim_padding_char_multiplier = {}
+    for dtype in (np.int16, np.int32):
+        audio = np.zeros(4800, dtype)
+        audio[2400] = np.iinfo(dtype).min
+        normalizer = AudioNormalizer()
+        normalizer.samples_to_pad_start = 0
+        assert normalizer.find_first_last_non_silent(
+            audio, "", 1.0, is_last_chunk=True
+        ) == (2400, 2400)

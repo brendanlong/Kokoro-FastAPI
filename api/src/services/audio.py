@@ -11,6 +11,21 @@ from ..inference.base import AudioChunk
 from .streaming_audio_writer import StreamingAudioWriter
 
 
+async def run_off_loop(fn, *args, **kwargs):
+    """asyncio.to_thread that outlives cancellation: a thread can't be interrupted, so a cancelled
+    caller still waits for it before unwinding, and cleanup (closing a writer) never races it."""
+    worker = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.wait({worker})
+            except asyncio.CancelledError:
+                pass
+        raise
+
+
 class AudioNormalizer:
     """Handles audio normalization state for a single stream"""
 
@@ -69,7 +84,9 @@ class AudioNormalizer:
         amplitude_threshold = np.iinfo(audio_data.dtype).max * (
             10 ** (silence_threshold_db / 20)
         )
-        loud = np.flatnonzero(np.abs(audio_data.astype(np.int32)) > amplitude_threshold)
+        loud = np.flatnonzero(
+            (audio_data > amplitude_threshold) | (audio_data < -amplitude_threshold)
+        )
         if len(loud) == 0:
             return 0, len(audio_data)
         non_silent_index_start, non_silent_index_end = loud[0], loud[-1]
@@ -153,7 +170,7 @@ class AudioService:
                 normalizer = AudioNormalizer()
 
             # Trimming and encoding are CPU-bound; a thread keeps other requests served meanwhile
-            return await asyncio.to_thread(
+            return await run_off_loop(
                 AudioService._trim_and_encode,
                 audio_chunk,
                 writer,
