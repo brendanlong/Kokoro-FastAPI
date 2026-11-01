@@ -473,3 +473,76 @@ async def test_generate_feeds_the_chunks_own_phonemes(phonemes, sent, kokoro_bac
             pass
     assert mock_pipeline.generate_from_tokens.call_args.kwargs["tokens"] == sent
     mock_pipeline.g2p.assert_not_called()
+
+
+class FakeModel:
+    """Each phoneme lasts two frames and sounds like its own constant; anything outside the
+    vocabulary is dropped, as KModel does."""
+
+    vocab = {c: i for i, c in enumerate(" .abcdefghijklmnopqrstuvwxyzˈ")}
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, ps, ref_s, speed, return_output=False):
+        self.calls.append(ps)
+        kept = [c for c in ps if c in self.vocab]
+        dur = torch.tensor([2] * (len(kept) + 2))
+        audio = torch.cat(
+            [torch.zeros(1200)]
+            + [torch.full((1200,), self.vocab[c] / 40) for c in kept]
+            + [torch.zeros(1200)]
+        )
+        return SimpleNamespace(audio=audio, pred_dur=dur)
+
+
+@pytest.mark.parametrize("dropped", ["", "¿"])
+async def test_over_long_chunk_streams_in_pieces_with_word_timestamps(
+    dropped, kokoro_backend, monkeypatch
+):
+    monkeypatch.setattr(settings, "absolute_max_tokens", 40)
+    kokoro_backend._model = FakeModel()
+    words = [f"word{i}" for i in range(30)]
+    phonemes = Phonemes(
+        " ".join(words),
+        dropped + " ".join("wˈord" + "abcdefgh"[i % 8] for i in range(30)),
+    )
+
+    with (
+        patch(
+            "api.src.core.paths.load_voice_tensor", return_value=torch.ones(510, 256)
+        ),
+        patch("api.src.core.paths.save_voice_tensor"),
+        patch("api.src.inference.g2p.pipeline"),
+    ):
+        chunks = [
+            c
+            async for c in kokoro_backend.generate(
+                phonemes, "af_voice", lang_code="e", return_timestamps=True
+            )
+        ]
+
+    assert len(chunks) == len(kokoro_backend._model.calls) > 1
+    stamps, offset = [], 0.0
+    for chunk in chunks:
+        stamps += [(t.word, t.start_time + offset) for t in chunk.word_timestamps]
+        offset += len(chunk.audio) / 24000
+    assert [word for word, _ in stamps] == words
+    assert all(a < b for (_, a), (_, b) in zip(stamps, stamps[1:]))
+    assert offset == pytest.approx(
+        len(phonemes.phonemes.lstrip("¿")) * 2 * 600 / 24000 + 0.1
+    )
+
+
+def test_word_spans_point_at_each_words_phonemes():
+    from api.src.inference import g2p
+    from api.src.inference.kokoro_v1 import _word_spans
+
+    phonemes = g2p.phonemize("Hello there, wide world.", "a")
+    spans = _word_spans(phonemes)
+
+    assert [w for w, _, _ in spans] == ["Hello", "there", ",", "wide", "world", "."]
+    tokens = [t for t in phonemes.tokens if t.phonemes]
+    assert [phonemes.phonemes[a : b + 1] for _, a, b in spans] == [
+        t.phonemes for t in tokens
+    ]

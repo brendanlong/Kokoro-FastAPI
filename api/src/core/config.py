@@ -63,9 +63,7 @@ class Settings(BaseSettings):
     # Audio Settings
     default_volume_multiplier: float = 1.0
     # Text Processing Settings
-    absolute_max_tokens: int = (
-        450  # Phonemes per chunk; a longer sentence is split, model limit is 510
-    )
+    absolute_max_tokens: int = 450  # Phonemes per chunk and per piece of an over-long clause; model limit is 510
     ssml_max_depth: int = (
         10  # Deepest SSML element nesting translated, real documents sit at 2-5
     )

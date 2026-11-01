@@ -115,7 +115,7 @@ Names are the field names from `api/src/core/config.py`, uppercased. Unrecognize
 
 | Variable | Default | |
 |---|---|---|
-| `ABSOLUTE_MAX_TOKENS` | `450` | Phonemes per chunk (one sentence per chunk); a longer sentence is split, model limit is 510 |
+| `ABSOLUTE_MAX_TOKENS` | `450` | Phonemes per chunk (one sentence per chunk). A longer sentence is split at clauses, and a clause still over it is rendered in overlapping pieces of up to this size. Model limit is 510 |
 | `ENABLE_SSML` | `true` | Kill switch for SSML translation, the `/dev/ssml` routes and `ssml: true` on the speech endpoints will 403 when off |
 | `SSML_MAX_DEPTH` | `10` | Deepest SSML nesting translated, past it is a 400 |
 | `MAX_PAUSE_DURATION_S` | `60.0` | Ceiling for a single `[pause:Ns]` tag or SSML `<break>`, longer values are clamped |

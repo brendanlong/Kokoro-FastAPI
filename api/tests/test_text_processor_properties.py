@@ -127,13 +127,23 @@ def test_smart_split_only_moves_whitespace(text):
     assert squash(" ".join(chunks)) == squash("".join(sentences))
 
 
-@given(runs, st.integers(min_value=3, max_value=40))
+CLAUSE = re.compile(r"[,;:，、；：]\s")
+
+
+@given(
+    st.one_of(runs, st.text(alphabet="ab ,;\n", max_size=300)),
+    st.integers(min_value=3, max_value=40),
+)
 def test_smart_split_honours_token_cap(text, max_tokens):
+    """Over the cap only as a single clause, which generation renders in overlapping pieces."""
     chunks = chunks_of(text, max_tokens)
-    # a word longer than the cap is cut too, and line joining adds periods: compare letters
-    letters = lambda t: re.sub(r"[^ab]", "", t)
+    # the splitter drops punctuation-only text and moves whitespace, so compare the letters
+    letters = lambda t: re.sub(r"[^a-z]", "", t)
     assert letters(" ".join(chunk for chunk, _ in chunks)) == letters(text)
-    assert all(len(phonemes) <= max_tokens for _, phonemes in chunks)
+    assert all(
+        len(phonemes) <= max_tokens or not CLAUSE.search(chunk)
+        for chunk, phonemes in chunks
+    )
 
 
 @given(st.one_of(any_text, lines))
