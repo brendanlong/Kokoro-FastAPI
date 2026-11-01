@@ -1,6 +1,8 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -475,3 +477,180 @@ def test_configure_rocm_backend_opt_out(restore_cudnn, monkeypatch):
     torch.backends.cudnn.enabled = True
     _configure_rocm_backend()
     assert torch.backends.cudnn.enabled is True
+
+
+def test_bake_weight_norm_keeps_output_and_drops_the_split_weights():
+    from api.src.inference.kokoro_v1 import _bake_weight_norm
+
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(
+        torch.nn.utils.weight_norm(torch.nn.Conv1d(4, 8, 3, padding=1)),
+        torch.nn.ReLU(),
+        torch.nn.utils.weight_norm(torch.nn.Linear(10, 6)),
+    ).eval()
+    x = torch.randn(2, 4, 10)
+    with torch.no_grad():
+        before = model(x)
+        _bake_weight_norm(model)
+        after = model(x)
+
+    assert torch.allclose(before, after, atol=1e-6)
+    assert not any(hasattr(m, "weight_g") for m in model.modules())
+    assert sum(p.numel() for p in model.parameters()) == 8 * 4 * 3 + 8 + 6 * 10 + 6
+
+
+@pytest.mark.parametrize(("device", "releases"), [("cuda", True), ("cpu", False)])
+@pytest.mark.parametrize("read_all", [True, False])
+async def test_generation_releases_cached_gpu_memory(
+    device, releases, read_all, kokoro_backend
+):
+    """Released when a generation finishes, or when its reader stops early (a disconnect)."""
+    kokoro_backend._model = MagicMock()
+    mock_pipeline = MagicMock(
+        side_effect=lambda *args, **kwargs: iter([_audio_result(), _audio_result()])
+    )
+    with (
+        patch.object(kokoro_backend, "_device", device),
+        patch.object(kokoro_backend, "_check_memory", return_value=False),
+        patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
+        patch("api.src.core.paths.save_voice_tensor"),
+        patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline),
+        patch("torch.cuda.empty_cache") as empty_cache,
+    ):
+        stream = kokoro_backend.generate("test", "af_voice")
+        if read_all:
+            chunks = [c async for c in stream]
+            assert len(chunks) == 2
+        else:
+            await anext(stream)
+            await stream.aclose()
+            # the inner stream is finalized by the event loop once the outer one lets go of it
+            for _ in range(20):
+                if empty_cache.called:
+                    break
+                await asyncio.sleep(0.01)
+    assert empty_cache.called == releases
+
+
+async def test_cuda_generation_runs_in_fp16_and_returns_fp32_audio(kokoro_backend):
+    """Half-precision on the GPU, but callers still get float32 audio to scale and encode."""
+    import contextlib
+
+    kokoro_backend._model = MagicMock()
+    autocasts = []
+
+    def fake_autocast(device_type, dtype=None, enabled=True):
+        autocasts.append((device_type, dtype, enabled))
+        return contextlib.nullcontext()
+
+    def run(*args, **kwargs):
+        yield SimpleNamespace(
+            audio=torch.full((4,), 0.5, dtype=torch.float16), tokens=None, phonemes=None
+        )
+
+    with (
+        patch.object(kokoro_backend, "_device", "cuda"),
+        patch.object(kokoro_backend, "_half", True),
+        patch.object(kokoro_backend, "_check_memory", return_value=False),
+        patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
+        patch("api.src.core.paths.save_voice_tensor"),
+        patch(
+            "api.src.inference.kokoro_v1.KPipeline",
+            return_value=MagicMock(side_effect=run),
+        ),
+        patch("api.src.inference.kokoro_v1.torch.autocast", side_effect=fake_autocast),
+        patch("torch.cuda.empty_cache"),
+    ):
+        chunks = [c async for c in kokoro_backend.generate("test", "af_voice")]
+    assert ("cuda", torch.float16, True) in autocasts
+    assert chunks[0].audio.dtype == np.float32
+
+
+@pytest.mark.parametrize(
+    ("capability", "hip", "half", "compiled"),
+    [
+        ((8, 6), None, True, True),
+        ((7, 0), None, True, True),
+        ((6, 1), None, False, False),
+        ((11, 0), "6.4", True, False),
+    ],
+)
+async def test_cuda_load_uses_fp16_and_compile_only_where_supported(
+    capability, hip, half, compiled, kokoro_backend
+):
+    """Maxwell and Pascal run fp16 far slower and Triton doesn't support them; ROCm compile is untested."""
+    model = MagicMock()
+    model.eval.return_value = model
+    model.cuda.return_value = model
+    with (
+        patch.object(kokoro_backend, "_device", "cuda"),
+        patch("api.src.inference.kokoro_v1.KModel", return_value=model),
+        patch("api.src.inference.kokoro_v1._bake_weight_norm"),
+        patch(
+            "api.src.inference.kokoro_v1.paths.get_model_path",
+            return_value="/m/kokoro-v1_0.pth",
+        ),
+        patch("api.src.inference.kokoro_v1.aiofiles.os.path.exists", return_value=True),
+        patch("torch.cuda.get_device_capability", return_value=capability),
+        patch("torch.version.hip", hip),
+        patch("api.src.inference.kokoro_v1._configure_rocm_backend"),
+        patch("api.src.inference.kokoro_v1._compile") as compile_model,
+    ):
+        await kokoro_backend.load_model("kokoro-v1_0.pth")
+    assert kokoro_backend._half == half
+    assert model.half.called == half
+    assert compile_model.called == compiled
+
+
+def _small_generator():
+    from kokoro.istftnet import Generator
+
+    # Kokoro-82M's generator settings, run on a short input
+    return Generator(
+        style_dim=128,
+        resblock_kernel_sizes=[3, 7, 11],
+        upsample_rates=[10, 6],
+        upsample_initial_channel=512,
+        resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+        upsample_kernel_sizes=[20, 12],
+        gen_istft_n_fft=20,
+        gen_istft_hop_size=5,
+    ).eval()
+
+
+def test_resblock_forward_traces_as_one_graph_with_the_same_output():
+    from kokoro.istftnet import AdaINResBlock1
+
+    from api.src.inference.kokoro_v1 import _resblock_forward
+
+    torch.manual_seed(0)
+    generator = _small_generator()
+    x, s, f0 = torch.randn(1, 512, 10), torch.randn(1, 128), torch.rand(1, 10) * 200
+    original = AdaINResBlock1.forward
+    try:
+        with torch.no_grad():
+            torch.manual_seed(1)
+            before = generator(x, s, f0)
+            AdaINResBlock1.forward = _resblock_forward
+            torch.manual_seed(1)
+            after = generator(x, s, f0)
+            breaks = torch._dynamo.explain(generator)(x, s, f0).graph_break_count
+    finally:
+        AdaINResBlock1.forward = original
+    assert torch.equal(before, after)
+    assert breaks == 0
+
+
+def test_unload_frees_a_model_caught_in_a_reference_cycle(kokoro_backend):
+    """torch.compile's wrappers point back at the modules they wrap; unload must still free them."""
+    import weakref
+
+    model = torch.nn.Linear(4, 4)
+    model.wrapped_forward = model.forward  # a cycle, like a compiled bound method
+    alive = weakref.ref(model)
+    kokoro_backend._model = model
+    del model
+
+    kokoro_backend.unload()
+
+    assert alive() is None

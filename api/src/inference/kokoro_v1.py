@@ -1,6 +1,7 @@
 """Clean Kokoro implementation with controlled resource management."""
 
 import asyncio
+import gc
 import os
 import threading
 from collections import OrderedDict
@@ -10,6 +11,7 @@ import aiofiles.os
 import numpy as np
 import torch
 from kokoro import KModel, KPipeline
+from kokoro.istftnet import AdaINResBlock1
 from loguru import logger
 
 from ..core import paths
@@ -87,6 +89,50 @@ def _espeak_word_timestamps(graphemes, phonemes, pred_dur, g2p=None):
         return None
 
 
+def _bake_weight_norm(model: torch.nn.Module) -> None:
+    """Fold kokoro's weight-normalised layers into plain weights.
+
+    Weight norm only matters for training; at inference it recomputes every
+    conv's weight on each call and keeps three copies of it. Folding saves
+    ~220 MB on CPU and the per-call recompute, with identical output.
+    """
+    for module in model.modules():
+        if hasattr(module, "weight_g"):
+            torch.nn.utils.remove_weight_norm(module)
+
+
+def _resblock_forward(self, x, s):
+    # kokoro's AdaINResBlock1.forward, indexing its ParameterLists instead of zip()ping them:
+    # torch.compile can't iterate a ParameterList, so it split the decoder into separate graphs
+    # and couldn't fuse the elementwise work. Proposed upstream; same output bit for bit.
+    for i in range(len(self.convs1)):
+        a1, a2 = self.alpha1[i], self.alpha2[i]
+        xt = self.adain1[i](x, s)
+        xt = xt + (1 / a1) * (torch.sin(a1 * xt) ** 2)  # Snake1D
+        xt = self.convs1[i](xt)
+        xt = self.adain2[i](xt, s)
+        xt = xt + (1 / a2) * (torch.sin(a2 * xt) ** 2)  # Snake1D
+        xt = self.convs2[i](xt)
+        x = xt + x
+    return x
+
+
+def _compile(model: KModel) -> None:
+    """torch.compile the model's fixed-graph stages, around the data-dependent duration step.
+
+    In fp16 on an RTX 3060 Ti a typical sentence goes from ~89 ms to ~50 ms. Kernels are
+    shape-generic (dynamic=True), so new lengths don't recompile once warmed up.
+    """
+    AdaINResBlock1.forward = _resblock_forward
+    generator = model.decoder.generator
+    # Compiled in fp16, the sine excitation (a running phase sum fed to sin) gave NaNs for some lengths
+    generator.m_source.forward = torch.compiler.disable(generator.m_source.forward)
+    model.bert = torch.compile(model.bert, dynamic=True)
+    model.text_encoder = torch.compile(model.text_encoder, dynamic=True)
+    model.predictor.F0Ntrain = torch.compile(model.predictor.F0Ntrain, dynamic=True)
+    model.decoder = torch.compile(model.decoder, dynamic=True)
+
+
 def _configure_rocm_backend() -> None:
     """Disable MIOpen on ROCm.
 
@@ -121,18 +167,33 @@ class KokoroV1(BaseModelBackend):
             OrderedDict()
         )  # LRU of voice tensors by path
         self._inference_lock = threading.Lock()  # one model call at a time
+        self._half = False
 
     def _next_locked(self, results, done):
-        with self._inference_lock:
+        with (
+            self._inference_lock,
+            torch.autocast("cuda", dtype=torch.float16, enabled=self._half),
+        ):
             return next(results, done)
+
+    def _release_cache(self):
+        # Under the lock, so a step still running in its thread finishes first
+        with self._inference_lock:
+            if self._device == "cuda":
+                # The caching allocator otherwise keeps the largest chunk's working memory
+                # (~1 GB on a long chunk) reserved for good; releasing it costs no measurable time.
+                torch.cuda.empty_cache()
 
     async def _iterate_off_loop(self, results):
         """Step a pipeline generator in a worker thread so the event loop keeps serving."""
         done = object()
-        while (
-            result := await asyncio.to_thread(self._next_locked, results, done)
-        ) is not done:
-            yield result
+        try:
+            while (
+                result := await asyncio.to_thread(self._next_locked, results, done)
+            ) is not done:
+                yield result
+        finally:
+            await asyncio.to_thread(self._release_cache)
 
     async def _get_voice_tensor(self, voice_path: str) -> torch.Tensor:
         """Load voice tensor with in-memory caching to avoid repeated file I/O.
@@ -185,6 +246,7 @@ class KokoroV1(BaseModelBackend):
             self._model = KModel(
                 repo_id=settings.model_repo_id, config=config_path, model=model_path
             ).eval()
+            _bake_weight_norm(self._model)
             # For MPS, manually move ISTFT layers to CPU while keeping rest on MPS
             if self._device == "mps":
                 logger.info(
@@ -195,6 +257,15 @@ class KokoroV1(BaseModelBackend):
                 # ROCm reports device "cuda", so this is the ROCm path too.
                 _configure_rocm_backend()
                 self._model = self._model.cuda()
+                # Half the memory and 20-25% faster on an RTX 3060 Ti, and indistinguishable by ear.
+                # Generation runs under autocast, which keeps precision-sensitive ops in fp32.
+                # Older cards (Maxwell, Pascal) have no tensor cores and run fp16 far slower,
+                # and Triton, which torch.compile needs, doesn't support them.
+                self._half = torch.cuda.get_device_capability() >= (7, 0)
+                if self._half:
+                    self._model = self._model.half()
+                if self._half and not torch.version.hip:
+                    _compile(self._model)
             else:
                 self._model = self._model.cpu()
 
@@ -303,7 +374,7 @@ class KokoroV1(BaseModelBackend):
                 if result.audio is not None:
                     logger.debug(f"Got audio chunk with shape: {result.audio.shape}")
                     yielded = True
-                    yield result.audio.numpy()
+                    yield result.audio.float().numpy()
                 else:
                     logger.warning("No audio in chunk")
 
@@ -473,7 +544,7 @@ class KokoroV1(BaseModelBackend):
 
                     yielded = True
                     yield AudioChunk(
-                        result.audio.numpy(), word_timestamps=word_timestamps
+                        result.audio.float().numpy(), word_timestamps=word_timestamps
                     )
                 else:
                     logger.warning("No audio in chunk")
@@ -525,6 +596,9 @@ class KokoroV1(BaseModelBackend):
             del pipeline
         self._pipelines.clear()
         self._voice_cache.clear()
+        # The compiled wrappers form reference cycles with the modules they wrap, so the
+        # weights would stay on the GPU until the next cyclic collection
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
