@@ -3,9 +3,11 @@
 import asyncio
 import gc
 import os
+import re
 import threading
 from collections import OrderedDict
-from typing import AsyncGenerator, Dict, Optional, Tuple, Union
+from functools import partial
+from typing import AsyncGenerator, Optional, Tuple, Union
 
 import aiofiles.os
 import numpy as np
@@ -18,7 +20,10 @@ from ..core import paths
 from ..core.config import settings
 from ..core.model_config import model_config
 from ..structures.schemas import WordTimestamp
+from . import g2p
 from .base import AudioChunk, BaseModelBackend
+from .g2p import Phonemes
+from .stitching import render_stitched
 
 # Distinct voices and mixes held in memory; each is about half a megabyte
 VOICE_CACHE_SIZE = 64
@@ -133,6 +138,33 @@ def _compile(model: KModel) -> None:
     model.decoder = torch.compile(model.decoder, dynamic=True)
 
 
+def _word_spans(phonemes: Phonemes):
+    """(word, first phoneme index, last phoneme index) for each word with phonemes.
+
+    English has its misaki tokens; other languages pair the text's words with the
+    space-separated phoneme groups, when the counts agree.
+    """
+    spans = []
+    if phonemes.tokens is not None:
+        raw = "".join(
+            t.phonemes + (" " if t.whitespace else "") for t in phonemes.tokens
+        )
+        offset = len(raw) - len(raw.lstrip())  # tokens_to_ps strips the joined string
+        position = -offset
+        for token in phonemes.tokens:
+            if token.text.strip() and token.phonemes and position >= 0:
+                spans.append(
+                    (token.text.strip(), position, position + len(token.phonemes) - 1)
+                )
+            position += len(token.phonemes) + (1 if token.whitespace else 0)
+        return spans
+    groups = [(m.start(), m.end() - 1) for m in re.finditer(r"\S+", phonemes.phonemes)]
+    words = phonemes.text.split()
+    if len(groups) != len(words):
+        return []
+    return [(word, first, last) for word, (first, last) in zip(words, groups)]
+
+
 def _configure_rocm_backend() -> None:
     """Disable MIOpen on ROCm.
 
@@ -162,7 +194,6 @@ class KokoroV1(BaseModelBackend):
         # Strictly respect settings.use_gpu
         self._device = settings.get_device()
         self._model: Optional[KModel] = None
-        self._pipelines: Dict[str, KPipeline] = {}  # Store pipelines by lang_code
         self._voice_cache: OrderedDict[str, torch.Tensor] = (
             OrderedDict()
         )  # LRU of voice tensors by path
@@ -275,26 +306,9 @@ class KokoroV1(BaseModelBackend):
             raise RuntimeError(f"Failed to load Kokoro model: {e}")
 
     def _get_pipeline(self, lang_code: str) -> KPipeline:
-        """Get or create pipeline for language code.
-
-        Args:
-            lang_code: Language code to use
-
-        Returns:
-            KPipeline instance for the language
-        """
         if not self._model:
             raise RuntimeError("Model not loaded")
-
-        if lang_code not in self._pipelines:
-            logger.info(f"Creating new pipeline for language code: {lang_code}")
-            self._pipelines[lang_code] = KPipeline(
-                lang_code=lang_code,
-                repo_id=settings.model_repo_id,
-                model=self._model,
-                device=self._device,
-            )
-        return self._pipelines[lang_code]
+        return g2p.pipeline(lang_code)
 
     async def generate_from_tokens(
         self,
@@ -396,9 +410,49 @@ class KokoroV1(BaseModelBackend):
                 return
             raise
 
+    def _render_stitched(self, phonemes: Phonemes, pack: torch.Tensor, speed: float):
+        """A clause too long for one chunk, rendered in overlapping pieces (see stitching.py).
+
+        Yields (audio, word timestamps) per piece; each next() is one model call.
+        """
+        ps = phonemes.phonemes
+        # The model silently drops phonemes outside its vocabulary (e.g. espeak's ¿ and ¡),
+        # which would shift every duration after them
+        kept = [i for i, c in enumerate(ps) if c in self._model.vocab]
+        rendered = set(kept)
+        spans = []
+        for word, first, last in _word_spans(phonemes):
+            inside = [i for i in range(first, last + 1) if i in rendered]
+            if inside:
+                spans.append((word, inside[0], inside[-1]))
+
+        def render(context, row):
+            out = self._model(context, pack[row - 1], speed, return_output=True)
+            return out.audio.float().numpy(), out.pred_dur.numpy()
+
+        filtered = "".join(ps[i] for i in kept)
+        for audio, times in render_stitched(
+            filtered, settings.absolute_max_tokens, render
+        ):
+            times = {kept[i]: t for i, t in times.items()}
+            words = []
+            for word, first, last in spans:
+                if first not in times:
+                    continue
+                start = times[first][0]
+                end = times[last][1] if last in times else len(audio)
+                words.append(
+                    WordTimestamp(
+                        word=word,
+                        start_time=round(start / 24000, 3),
+                        end_time=round(end / 24000, 3),
+                    )
+                )
+            yield audio, words
+
     async def generate(
         self,
-        text: str,
+        phonemes: Phonemes,
         voice: Union[str, Tuple[str, Union[torch.Tensor, str]]],
         speed: float = 1.0,
         lang_code: Optional[str] = None,
@@ -408,7 +462,7 @@ class KokoroV1(BaseModelBackend):
         """Generate audio using model.
 
         Args:
-            text: Input text to synthesize
+            phonemes: Phonemized chunk to synthesize
             voice: Either a voice path string or a tuple of (voice_name, voice_tensor/path)
             speed: Speed multiplier
             lang_code: Optional language code override
@@ -466,10 +520,24 @@ class KokoroV1(BaseModelBackend):
             pipeline = self._get_pipeline(pipeline_lang_code)
 
             logger.debug(
-                f"Generating audio for text with lang_code '{pipeline_lang_code}': '{text[:100]}{'...' if len(text) > 100 else ''}'"
+                f"Generating audio with lang_code '{pipeline_lang_code}': '{phonemes.text[:100]}{'...' if len(phonemes.text) > 100 else ''}'"
             )
+            if len(phonemes.phonemes) > settings.absolute_max_tokens:
+                async for audio, words in self._iterate_off_loop(
+                    self._render_stitched(phonemes, voice_pack, speed)
+                ):
+                    yielded = True
+                    yield AudioChunk(
+                        audio, word_timestamps=words if return_timestamps else None
+                    )
+                return
             async for result in self._iterate_off_loop(
-                pipeline(text, voice=voice_pack, speed=speed, model=self._model)
+                pipeline.generate_from_tokens(
+                    tokens=phonemes.tokens or phonemes.phonemes,
+                    voice=voice_pack,
+                    speed=speed,
+                    model=self._model,
+                )
             ):
                 if result.audio is not None:
                     logger.debug(f"Got audio chunk with shape: {result.audio.shape}")
@@ -536,10 +604,10 @@ class KokoroV1(BaseModelBackend):
                         ):
                             pred_dur = getattr(result.output, "pred_dur", None)
                         word_timestamps = _espeak_word_timestamps(
-                            result.graphemes,
+                            phonemes.text,
                             result.phonemes,
                             pred_dur,
-                            g2p=getattr(pipeline, "g2p", None),
+                            g2p=partial(g2p.raw, lang_code=pipeline_lang_code),
                         )
 
                     yielded = True
@@ -560,7 +628,12 @@ class KokoroV1(BaseModelBackend):
             ):
                 self._clear_memory()
                 async for chunk in self.generate(
-                    text, voice, speed, lang_code, return_timestamps, _retry_oom=False
+                    phonemes,
+                    voice,
+                    speed,
+                    lang_code,
+                    return_timestamps,
+                    _retry_oom=False,
                 ):
                     yield chunk
                 return
@@ -592,9 +665,6 @@ class KokoroV1(BaseModelBackend):
         if self._model is not None:
             del self._model
             self._model = None
-        for pipeline in self._pipelines.values():
-            del pipeline
-        self._pipelines.clear()
         self._voice_cache.clear()
         # The compiled wrappers form reference cycles with the modules they wrap, so the
         # weights would stay on the GPU until the next cyclic collection

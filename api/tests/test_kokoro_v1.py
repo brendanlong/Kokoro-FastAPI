@@ -7,7 +7,19 @@ import pytest
 import torch
 
 from api.src.core.config import settings
+from api.src.inference.g2p import Phonemes
 from api.src.inference.kokoro_v1 import KokoroV1, _configure_rocm_backend
+
+TEST = Phonemes("test", "tˈɛst")
+
+
+def _inputs(method):
+    """What each generation method takes: a phonemized chunk, or raw phonemes."""
+    return TEST if method == "generate" else TEST.phonemes
+
+
+def _pipeline(run):
+    return MagicMock(generate_from_tokens=MagicMock(side_effect=run))
 
 
 @pytest.fixture
@@ -20,7 +32,6 @@ def test_initial_state(kokoro_backend):
     """Test initial state of KokoroV1."""
     assert not kokoro_backend.is_loaded
     assert kokoro_backend._model is None
-    assert kokoro_backend._pipelines == {}  # Now using dict of pipelines
     # Device should be set based on settings
     assert kokoro_backend.device in ["cuda", "cpu", "mps"]
 
@@ -54,7 +65,7 @@ def test_mps_memory_management(mock_memory, kokoro_backend):
 @pytest.mark.parametrize("method", ["generate", "generate_from_tokens"])
 async def test_generate_clears_mps_memory_over_threshold(method, kokoro_backend):
     kokoro_backend._model = MagicMock()
-    mock_pipeline = MagicMock(return_value=iter([]))
+    mock_pipeline = MagicMock()
     mock_pipeline.generate_from_tokens.return_value = iter([])
     with (
         patch.object(kokoro_backend, "_device", "mps"),
@@ -62,9 +73,9 @@ async def test_generate_clears_mps_memory_over_threshold(method, kokoro_backend)
         patch.object(kokoro_backend, "_clear_memory") as mock_clear,
         patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
         patch("api.src.core.paths.save_voice_tensor"),
-        patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline),
+        patch("api.src.inference.g2p.pipeline", return_value=mock_pipeline),
     ):
-        async for _ in getattr(kokoro_backend, method)("test", "af_voice"):
+        async for _ in getattr(kokoro_backend, method)(_inputs(method), "af_voice"):
             pass
     mock_clear.assert_called_once()
 
@@ -103,12 +114,12 @@ async def test_generation_does_not_block_event_loop(kokoro_backend):
         patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
         patch("api.src.core.paths.save_voice_tensor"),
         patch(
-            "api.src.inference.kokoro_v1.KPipeline",
-            return_value=MagicMock(side_effect=slow_pipeline),
+            "api.src.inference.g2p.pipeline",
+            return_value=_pipeline(slow_pipeline),
         ),
     ):
         task = asyncio.create_task(ticker())
-        chunks = [c async for c in kokoro_backend.generate("test", "af_voice")]
+        chunks = [c async for c in kokoro_backend.generate(TEST, "af_voice")]
         task.cancel()
     assert len(chunks) == 3
     assert ticks > 10
@@ -136,14 +147,14 @@ async def test_concurrent_generations_take_turns_on_the_model(kokoro_backend):
             yield SimpleNamespace(audio=torch.zeros(4), tokens=None, phonemes=None)
 
     async def run():
-        return [c async for c in kokoro_backend.generate("test", "af_voice")]
+        return [c async for c in kokoro_backend.generate(TEST, "af_voice")]
 
     with (
         patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
         patch("api.src.core.paths.save_voice_tensor"),
         patch(
-            "api.src.inference.kokoro_v1.KPipeline",
-            return_value=MagicMock(side_effect=pipeline),
+            "api.src.inference.g2p.pipeline",
+            return_value=_pipeline(pipeline),
         ),
     ):
         results = await asyncio.gather(run(), run(), run())
@@ -161,9 +172,7 @@ def _oom_backend(kokoro_backend, outcomes):
             raise outcome
         return iter(outcome)
 
-    mock_pipeline = MagicMock(side_effect=run)
-    mock_pipeline.generate_from_tokens.side_effect = run
-    return mock_pipeline
+    return _pipeline(run)
 
 
 def _audio_result():
@@ -180,10 +189,10 @@ async def test_oom_retries_once_then_raises(method, kokoro_backend):
         patch.object(kokoro_backend, "_clear_memory") as mock_clear,
         patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
         patch("api.src.core.paths.save_voice_tensor"),
-        patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline),
+        patch("api.src.inference.g2p.pipeline", return_value=mock_pipeline),
     ):
         with pytest.raises(RuntimeError, match="out of memory"):
-            async for _ in getattr(kokoro_backend, method)("test", "af_voice"):
+            async for _ in getattr(kokoro_backend, method)(_inputs(method), "af_voice"):
                 pass
     assert len(outcomes) == 1
     mock_clear.assert_called_once()
@@ -199,9 +208,12 @@ async def test_oom_retry_success_does_not_raise(method, kokoro_backend):
         patch.object(kokoro_backend, "_clear_memory"),
         patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
         patch("api.src.core.paths.save_voice_tensor"),
-        patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline),
+        patch("api.src.inference.g2p.pipeline", return_value=mock_pipeline),
     ):
-        chunks = [c async for c in getattr(kokoro_backend, method)("test", "af_voice")]
+        chunks = [
+            c
+            async for c in getattr(kokoro_backend, method)(_inputs(method), "af_voice")
+        ]
     assert len(chunks) == 1
 
 
@@ -211,21 +223,21 @@ async def test_oom_after_audio_is_not_retried(kokoro_backend):
         raise RuntimeError("CUDA out of memory")
 
     kokoro_backend._model = MagicMock()
-    mock_pipeline = MagicMock(side_effect=run)
+    mock_pipeline = _pipeline(run)
     with (
         patch.object(kokoro_backend, "_device", "cuda"),
         patch.object(kokoro_backend, "_check_memory", return_value=False),
         patch.object(kokoro_backend, "_clear_memory") as mock_clear,
         patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
         patch("api.src.core.paths.save_voice_tensor"),
-        patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline),
+        patch("api.src.inference.g2p.pipeline", return_value=mock_pipeline),
     ):
         chunks = []
         with pytest.raises(RuntimeError, match="out of memory"):
-            async for chunk in kokoro_backend.generate("test", "af_voice"):
+            async for chunk in kokoro_backend.generate(TEST, "af_voice"):
                 chunks.append(chunk)
     assert len(chunks) == 1
-    assert mock_pipeline.call_count == 1
+    assert mock_pipeline.generate_from_tokens.call_count == 1
     mock_clear.assert_not_called()
 
 
@@ -239,13 +251,8 @@ def test_clear_memory(mock_sync, mock_clear, kokoro_backend):
         mock_sync.assert_called_once()
 
 
-def test_unload_with_pipelines(kokoro_backend):
-    """Test model unloading with multiple pipelines."""
-    # Mock loaded state with multiple pipelines
+def test_unload_releases_model_and_voices(kokoro_backend):
     kokoro_backend._model = MagicMock()
-    pipeline_a = MagicMock()
-    pipeline_e = MagicMock()
-    kokoro_backend._pipelines = {"a": pipeline_a, "e": pipeline_e}
     kokoro_backend._voice_cache = {"af_heart.pt:cpu": MagicMock()}
     assert kokoro_backend.is_loaded
 
@@ -253,7 +260,6 @@ def test_unload_with_pipelines(kokoro_backend):
     kokoro_backend.unload()
     assert not kokoro_backend.is_loaded
     assert kokoro_backend._model is None
-    assert kokoro_backend._pipelines == {}  # All pipelines should be cleared
     assert kokoro_backend._voice_cache == {}  # Voice tensors should be released
 
 
@@ -261,7 +267,7 @@ def test_unload_with_pipelines(kokoro_backend):
 async def test_generate_validation(kokoro_backend):
     """Test generation validation."""
     with pytest.raises(RuntimeError, match="Model not loaded"):
-        async for _ in kokoro_backend.generate("test", "voice"):
+        async for _ in kokoro_backend.generate(TEST, "voice"):
             pass
 
 
@@ -273,48 +279,13 @@ async def test_generate_from_tokens_validation(kokoro_backend):
             pass
 
 
-def test_get_pipeline_creates_new(kokoro_backend):
-    """Test that _get_pipeline creates new pipeline for new language code."""
-    # Mock loaded state
+def test_get_pipeline_is_the_shared_g2p_pipeline(kokoro_backend):
+    """Generation uses the same per-language pipeline chunking phonemized with."""
     kokoro_backend._model = MagicMock()
-
-    # Mock KPipeline
     mock_pipeline = MagicMock()
-    with patch(
-        "api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline
-    ) as mock_kpipeline:
-        # Get pipeline for Spanish
-        pipeline_e = kokoro_backend._get_pipeline("e")
-
-        # Should create new pipeline with correct params
-        mock_kpipeline.assert_called_once_with(
-            lang_code="e",
-            repo_id=settings.model_repo_id,
-            model=kokoro_backend._model,
-            device=kokoro_backend._device,
-        )
-        assert pipeline_e == mock_pipeline
-        assert kokoro_backend._pipelines["e"] == mock_pipeline
-
-
-def test_get_pipeline_reuses_existing(kokoro_backend):
-    """Test that _get_pipeline reuses existing pipeline for same language code."""
-    # Mock loaded state
-    kokoro_backend._model = MagicMock()
-
-    # Mock KPipeline
-    mock_pipeline = MagicMock()
-    with patch(
-        "api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline
-    ) as mock_kpipeline:
-        # Get pipeline twice for same language
-        pipeline1 = kokoro_backend._get_pipeline("e")
-        pipeline2 = kokoro_backend._get_pipeline("e")
-
-        # Should only create pipeline once
-        mock_kpipeline.assert_called_once()
-        assert pipeline1 == pipeline2
-        assert kokoro_backend._pipelines["e"] == mock_pipeline
+    with patch("api.src.inference.g2p.pipeline", return_value=mock_pipeline) as factory:
+        assert kokoro_backend._get_pipeline("e") is mock_pipeline
+    factory.assert_called_once_with("e")
 
 
 @pytest.mark.asyncio
@@ -330,25 +301,25 @@ async def test_generate_uses_correct_pipeline(kokoro_backend):
     ):
         mock_load_voice.return_value = torch.ones(1)
 
-        # Mock KPipeline
         mock_pipeline = MagicMock()
-        mock_pipeline.return_value = iter([])  # Empty generator for testing
-        with patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline):
-            # Generate with Spanish voice and explicit lang_code
-            async for _ in kokoro_backend.generate("test", "ef_voice", lang_code="e"):
+        mock_pipeline.generate_from_tokens.return_value = iter([])
+        with patch(
+            "api.src.inference.g2p.pipeline", return_value=mock_pipeline
+        ) as factory:
+            async for _ in kokoro_backend.generate(TEST, "ef_voice", lang_code="e"):
                 pass
 
-            # Should create pipeline with Spanish lang_code and call it.
-            assert "e" in kokoro_backend._pipelines
-            mock_pipeline.assert_called_with(
-                "test",
+            factory.assert_called_with("e")
+            mock_pipeline.generate_from_tokens.assert_called_with(
+                tokens=TEST.phonemes,
                 voice=ANY,
                 speed=1.0,
                 model=kokoro_backend._model,
             )
             # The cached tensor goes to the pipeline directly, so nothing is
             # staged in the temp dir or kept in pipeline.voices
-            assert torch.equal(mock_pipeline.call_args[1]["voice"], torch.ones(1))
+            voice = mock_pipeline.generate_from_tokens.call_args[1]["voice"]
+            assert torch.equal(voice, torch.ones(1))
 
 
 @pytest.mark.asyncio
@@ -370,12 +341,16 @@ async def test_generate_skips_untimed_tokens(kokoro_backend):
         patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
         patch("api.src.core.paths.save_voice_tensor"),
     ):
-        mock_pipeline = MagicMock(return_value=iter([result]))
-        with patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline):
+        mock_pipeline = MagicMock()
+        mock_pipeline.generate_from_tokens.return_value = iter([result])
+        with patch("api.src.inference.g2p.pipeline", return_value=mock_pipeline):
             chunks = [
                 c
                 async for c in kokoro_backend.generate(
-                    "What--key", "af_voice", lang_code="a", return_timestamps=True
+                    Phonemes("What--key", "wʌt kˈi", tokens),
+                    "af_voice",
+                    lang_code="a",
+                    return_timestamps=True,
                 )
             ]
 
@@ -506,18 +481,18 @@ async def test_generation_releases_cached_gpu_memory(
 ):
     """Released when a generation finishes, or when its reader stops early (a disconnect)."""
     kokoro_backend._model = MagicMock()
-    mock_pipeline = MagicMock(
-        side_effect=lambda *args, **kwargs: iter([_audio_result(), _audio_result()])
+    mock_pipeline = _pipeline(
+        lambda *args, **kwargs: iter([_audio_result(), _audio_result()])
     )
     with (
         patch.object(kokoro_backend, "_device", device),
         patch.object(kokoro_backend, "_check_memory", return_value=False),
         patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
         patch("api.src.core.paths.save_voice_tensor"),
-        patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline),
+        patch("api.src.inference.g2p.pipeline", return_value=mock_pipeline),
         patch("torch.cuda.empty_cache") as empty_cache,
     ):
-        stream = kokoro_backend.generate("test", "af_voice")
+        stream = kokoro_backend.generate(TEST, "af_voice")
         if read_all:
             chunks = [c async for c in stream]
             assert len(chunks) == 2
@@ -554,14 +529,11 @@ async def test_cuda_generation_runs_in_fp16_and_returns_fp32_audio(kokoro_backen
         patch.object(kokoro_backend, "_check_memory", return_value=False),
         patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
         patch("api.src.core.paths.save_voice_tensor"),
-        patch(
-            "api.src.inference.kokoro_v1.KPipeline",
-            return_value=MagicMock(side_effect=run),
-        ),
+        patch("api.src.inference.g2p.pipeline", return_value=_pipeline(run)),
         patch("api.src.inference.kokoro_v1.torch.autocast", side_effect=fake_autocast),
         patch("torch.cuda.empty_cache"),
     ):
-        chunks = [c async for c in kokoro_backend.generate("test", "af_voice")]
+        chunks = [c async for c in kokoro_backend.generate(TEST, "af_voice")]
     assert ("cuda", torch.float16, True) in autocasts
     assert chunks[0].audio.dtype == np.float32
 
@@ -654,3 +626,99 @@ def test_unload_frees_a_model_caught_in_a_reference_cycle(kokoro_backend):
     kokoro_backend.unload()
 
     assert alive() is None
+
+
+@pytest.mark.parametrize(
+    ("phonemes", "sent"),
+    [
+        (Phonemes("Hi.", "hˈI.", ["token"]), ["token"]),
+        (Phonemes("hola", "ˈola"), "ˈola"),
+    ],
+)
+async def test_generate_feeds_the_chunks_own_phonemes(phonemes, sent, kokoro_backend):
+    """English sends its words (for timestamps); other languages the phoneme string. No G2P again."""
+    kokoro_backend._model = MagicMock()
+    mock_pipeline = MagicMock()
+    mock_pipeline.generate_from_tokens.return_value = iter([])
+    with (
+        patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
+        patch("api.src.core.paths.save_voice_tensor"),
+        patch("api.src.inference.g2p.pipeline", return_value=mock_pipeline),
+    ):
+        async for _ in kokoro_backend.generate(phonemes, "af_voice"):
+            pass
+    assert mock_pipeline.generate_from_tokens.call_args.kwargs["tokens"] == sent
+    mock_pipeline.g2p.assert_not_called()
+
+
+class FakeModel:
+    """Each phoneme lasts two frames and sounds like its own constant; anything outside the
+    vocabulary is dropped, as KModel does."""
+
+    vocab = {c: i for i, c in enumerate(" .abcdefghijklmnopqrstuvwxyzˈ")}
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, ps, ref_s, speed, return_output=False):
+        self.calls.append(ps)
+        kept = [c for c in ps if c in self.vocab]
+        dur = torch.tensor([2] * (len(kept) + 2))
+        audio = torch.cat(
+            [torch.zeros(1200)]
+            + [torch.full((1200,), self.vocab[c] / 40) for c in kept]
+            + [torch.zeros(1200)]
+        )
+        return SimpleNamespace(audio=audio, pred_dur=dur)
+
+
+@pytest.mark.parametrize("dropped", ["", "¿"])
+async def test_over_long_chunk_streams_in_pieces_with_word_timestamps(
+    dropped, kokoro_backend, monkeypatch
+):
+    monkeypatch.setattr(settings, "absolute_max_tokens", 40)
+    kokoro_backend._model = FakeModel()
+    words = [f"word{i}" for i in range(30)]
+    phonemes = Phonemes(
+        " ".join(words),
+        dropped + " ".join("wˈord" + "abcdefgh"[i % 8] for i in range(30)),
+    )
+
+    with (
+        patch(
+            "api.src.core.paths.load_voice_tensor", return_value=torch.ones(510, 256)
+        ),
+        patch("api.src.core.paths.save_voice_tensor"),
+        patch("api.src.inference.g2p.pipeline"),
+    ):
+        chunks = [
+            c
+            async for c in kokoro_backend.generate(
+                phonemes, "af_voice", lang_code="e", return_timestamps=True
+            )
+        ]
+
+    assert len(chunks) == len(kokoro_backend._model.calls) > 1
+    stamps, offset = [], 0.0
+    for chunk in chunks:
+        stamps += [(t.word, t.start_time + offset) for t in chunk.word_timestamps]
+        offset += len(chunk.audio) / 24000
+    assert [word for word, _ in stamps] == words
+    assert all(a < b for (_, a), (_, b) in zip(stamps, stamps[1:]))
+    assert offset == pytest.approx(
+        len(phonemes.phonemes.lstrip("¿")) * 2 * 600 / 24000 + 0.1
+    )
+
+
+def test_word_spans_point_at_each_words_phonemes():
+    from api.src.inference import g2p
+    from api.src.inference.kokoro_v1 import _word_spans
+
+    phonemes = g2p.phonemize("Hello there, wide world.", "a")
+    spans = _word_spans(phonemes)
+
+    assert [w for w, _, _ in spans] == ["Hello", "there", ",", "wide", "world", "."]
+    tokens = [t for t in phonemes.tokens if t.phonemes]
+    assert [phonemes.phonemes[a : b + 1] for _, a, b in spans] == [
+        t.phonemes for t in tokens
+    ]

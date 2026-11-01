@@ -130,12 +130,12 @@ def test_join_lines_is_fast():
 
 def test_unbalanced_brackets_are_fast():
     """Stray brackets must not hang the splitter (issue #287)."""
-    from api.src.services.text_processing.text_processor import get_sentence_info
+    from unicode_segmentation_rs import unicode_sentences
 
     text = "MR. BOWERS: Nothing that I can recall. [Emphasis supplied.).\n" * 100
     start = time.monotonic()
     normalize_text(text, OPTS)
-    list(get_sentence_info(text))
+    list(unicode_sentences(text))
     assert time.monotonic() - start < BUDGET_S
 
 

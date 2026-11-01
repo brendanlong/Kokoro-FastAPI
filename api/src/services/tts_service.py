@@ -15,6 +15,7 @@ from loguru import logger
 
 from ..core.config import settings
 from ..inference.base import AudioChunk
+from ..inference.g2p import Phonemes
 from ..inference.kokoro_v1 import VOICE_CACHE_SIZE, KokoroV1
 from ..inference.model_manager import (
     ModelManager,
@@ -62,7 +63,7 @@ class TTSService:
     async def _process_chunk(
         self,
         chunk_text: str,
-        tokens: List[int],
+        phonemes: Optional[Phonemes],
         voice_name: str,
         voice_path: str,
         speed: float,
@@ -97,65 +98,17 @@ class TTSService:
                 yield chunk_data
                 return
 
-            # Skip empty chunks
-            if not tokens and not chunk_text:
+            if not phonemes or not phonemes.phonemes:
                 return
 
-            await self.model_manager.ensure_backend()
-            backend = self.model_manager.get_backend()
-
-            # Generate audio using pre-warmed model
-            if isinstance(backend, KokoroV1):
-                chunk_index = 0
-                # For Kokoro V1, pass text and voice info with lang_code
-                async for chunk_data in self.model_manager.generate(
-                    chunk_text,
-                    (voice_name, voice_path),
-                    speed=speed,
-                    lang_code=lang_code,
-                    return_timestamps=return_timestamps,
-                ):
-                    chunk_data.audio *= volume_multiplier
-                    # For streaming, convert to bytes
-                    if output_format:
-                        chunk_data = await AudioService.convert_audio(
-                            chunk_data,
-                            output_format,
-                            writer,
-                            speed,
-                            chunk_text,
-                            is_last_chunk=is_last,
-                            normalizer=normalizer,
-                        )
-                        yield chunk_data
-                    else:
-                        chunk_data = AudioService.trim_audio(
-                            chunk_data, chunk_text, speed, is_last, normalizer
-                        )
-                        yield chunk_data
-                    chunk_index += 1
-            else:
-                # For legacy backends, load voice tensor
-                voice_tensor = await self._voice_manager.load_voice(
-                    voice_name, device=backend.device
-                )
-                chunk_data = await self.model_manager.generate(
-                    tokens,
-                    voice_tensor,
-                    speed=speed,
-                    return_timestamps=return_timestamps,
-                )
-
-                if chunk_data.audio is None:
-                    logger.error("Model generated None for audio chunk")
-                    return
-
-                if len(chunk_data.audio) == 0:
-                    logger.error("Model generated empty audio chunk")
-                    return
-
+            async for chunk_data in self.model_manager.generate(
+                phonemes,
+                (voice_name, voice_path),
+                speed=speed,
+                lang_code=lang_code,
+                return_timestamps=return_timestamps,
+            ):
                 chunk_data.audio *= volume_multiplier
-
                 # For streaming, convert to bytes
                 if output_format:
                     chunk_data = await AudioService.convert_audio(
@@ -164,15 +117,14 @@ class TTSService:
                         writer,
                         speed,
                         chunk_text,
-                        normalizer=normalizer,
                         is_last_chunk=is_last,
+                        normalizer=normalizer,
                     )
-                    yield chunk_data
                 else:
-                    trimmed = AudioService.trim_audio(
+                    chunk_data = AudioService.trim_audio(
                         chunk_data, chunk_text, speed, is_last, normalizer
                     )
-                    yield trimmed
+                yield chunk_data
 
     async def _load_voice_from_path(self, path: str, weight: float):
         # Check if the path is None and raise a ValueError if it is not
@@ -274,11 +226,11 @@ class TTSService:
         normalization_options: Optional[NormalizationOptions],
         allow_voice_tags: bool = False,
     ) -> AsyncGenerator[
-        Tuple[str, str, str, float, str, List[int], Optional[float]], None
+        Tuple[str, str, str, float, str, Optional[Phonemes], Optional[float]], None
     ]:
         """Chunk text across [voice:...] and [rate:...] segments.
 
-        Yields (voice_name, voice_path, lang_code, rate, chunk_text, tokens, pause_s).
+        Yields (voice_name, voice_path, lang_code, rate, chunk_text, phonemes, pause_s).
         Each distinct speaker is resolved once per request; the backend then
         caches its tensor and pipeline, so switching voices between chunks costs
         no extra model work.
@@ -305,7 +257,7 @@ class TTSService:
                 f"Using voice path '{voice_path}' with lang_code '{segment_lang}'"
             )
 
-            async for chunk_text, tokens, pause_duration_s in smart_split(
+            async for chunk_text, phonemes, pause_duration_s in smart_split(
                 segment_text,
                 lang_code=segment_lang,
                 normalization_options=normalization_options,
@@ -316,7 +268,7 @@ class TTSService:
                     segment_lang,
                     segment_rate,
                     chunk_text,
-                    tokens,
+                    phonemes,
                     pause_duration_s,
                 )
 
@@ -350,7 +302,7 @@ class TTSService:
                 pipeline_lang_code,
                 segment_rate,
                 chunk_text,
-                tokens,
+                phonemes,
                 pause_duration_s,
             ) in self._split_multi_voice(
                 text, voice, lang_code, normalization_options, allow_voice_tags
@@ -406,15 +358,13 @@ class TTSService:
                         logger.error(f"Failed to process pause chunk: {str(e)}")
                         continue
 
-                elif (
-                    tokens or chunk_text.strip()
-                ):  # Process if there are tokens OR non-whitespace text
+                elif phonemes and phonemes.phonemes:
                     # --- Handle Text Chunk ---
                     chunk_start_offset = current_offset
                     # Process audio for chunk
                     async for chunk_data in self._process_chunk(
-                        chunk_text,  # Pass text for Kokoro V1
-                        tokens,  # Pass tokens for legacy backends
+                        chunk_text,
+                        phonemes,
                         voice_name,  # Pass voice name
                         voice_path,  # Pass voice path
                         clamp_rate(speed * segment_rate),
@@ -466,7 +416,7 @@ class TTSService:
                 # Empty tokens list to finalize audio
                 async for chunk_data in self._process_chunk(
                     "",  # Empty text
-                    [],  # Empty tokens
+                    None,
                     voice_name,
                     voice_path,
                     speed,
