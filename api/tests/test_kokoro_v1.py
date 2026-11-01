@@ -126,24 +126,29 @@ async def test_generation_does_not_block_event_loop(kokoro_backend):
 
 
 async def test_concurrent_generations_take_turns_on_the_model(kokoro_backend):
+    """Model calls never overlap, but nothing else a generation does waits for the model."""
     import asyncio
     import threading
     import time
 
-    kokoro_backend._model = MagicMock()
     active = 0
     peak = 0
     guard = threading.Lock()
 
-    def pipeline(*args, **kwargs):
+    def model_call(*args, **kwargs):
         nonlocal active, peak
+        with guard:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.02)
+        with guard:
+            active -= 1
+
+    kokoro_backend._model = MagicMock(side_effect=model_call)
+
+    def pipeline(*args, model, **kwargs):
         for _ in range(3):
-            with guard:
-                active += 1
-                peak = max(peak, active)
-            time.sleep(0.02)
-            with guard:
-                active -= 1
+            model("phonemes")
             yield SimpleNamespace(audio=torch.zeros(4), tokens=None, phonemes=None)
 
     async def run():
@@ -159,7 +164,46 @@ async def test_concurrent_generations_take_turns_on_the_model(kokoro_backend):
     ):
         results = await asyncio.gather(run(), run(), run())
     assert [len(r) for r in results] == [3, 3, 3]
+    assert kokoro_backend._model.call_count == 9
     assert peak == 1
+
+
+async def test_finishing_a_generation_does_not_wait_for_another_requests_model_call(
+    kokoro_backend,
+):
+    """The step that only reports a generation is done used to queue behind the model lock."""
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+
+    def slow_model(*args, **kwargs):
+        started.set()
+        release.wait(5)
+
+    def one_step(*args, model, **kwargs):
+        yield SimpleNamespace(audio=torch.zeros(4), tokens=None, phonemes=None)
+
+    kokoro_backend._model = MagicMock(side_effect=slow_model)
+    with (
+        patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
+        patch("api.src.core.paths.save_voice_tensor"),
+        patch("api.src.inference.g2p.pipeline", return_value=_pipeline(one_step)),
+    ):
+        # another request is mid-model-call, holding the lock
+        blocker = asyncio.create_task(
+            asyncio.to_thread(kokoro_backend._locked_model, "phonemes")
+        )
+        await asyncio.to_thread(started.wait, 5)
+        chunks = await asyncio.wait_for(
+            _collect(kokoro_backend.generate(TEST, "af_voice")), timeout=2
+        )
+        release.set()
+        await blocker
+    assert len(chunks) == 1
+
+
+async def _collect(stream):
+    return [c async for c in stream]
 
 
 def _oom_backend(kokoro_backend, outcomes):
@@ -314,7 +358,7 @@ async def test_generate_uses_correct_pipeline(kokoro_backend):
                 tokens=TEST.phonemes,
                 voice=ANY,
                 speed=1.0,
-                model=kokoro_backend._model,
+                model=kokoro_backend._locked_model,
             )
             # The cached tensor goes to the pipeline directly, so nothing is
             # staged in the temp dir or kept in pipeline.voices
@@ -518,7 +562,8 @@ async def test_cuda_generation_runs_in_fp16_and_returns_fp32_audio(kokoro_backen
         autocasts.append((device_type, dtype, enabled))
         return contextlib.nullcontext()
 
-    def run(*args, **kwargs):
+    def run(*args, model, **kwargs):
+        model("phonemes")
         yield SimpleNamespace(
             audio=torch.full((4,), 0.5, dtype=torch.float16), tokens=None, phonemes=None
         )

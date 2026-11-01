@@ -185,6 +185,25 @@ def _configure_rocm_backend() -> None:
     logger.info("ROCm detected: MIOpen disabled to avoid per-shape kernel compilation")
 
 
+class _LockedModel:
+    """The model as KPipeline calls it, one call at a time and at the backend's precision."""
+
+    def __init__(self, backend: "KokoroV1"):
+        self._backend = backend
+
+    @property
+    def device(self):
+        return self._backend._model.device
+
+    def __call__(self, *args, **kwargs):
+        backend = self._backend
+        with (
+            backend._inference_lock,
+            torch.autocast("cuda", dtype=torch.float16, enabled=backend._half),
+        ):
+            return backend._model(*args, **kwargs)
+
+
 class KokoroV1(BaseModelBackend):
     """Kokoro backend with controlled resource management."""
 
@@ -199,32 +218,28 @@ class KokoroV1(BaseModelBackend):
         )  # LRU of voice tensors by path
         self._inference_lock = threading.Lock()  # one model call at a time
         self._half = False
-
-    def _next_locked(self, results, done):
-        with (
-            self._inference_lock,
-            torch.autocast("cuda", dtype=torch.float16, enabled=self._half),
-        ):
-            return next(results, done)
-
-    def _release_cache(self):
-        # Under the lock, so a step still running in its thread finishes first
-        with self._inference_lock:
-            if self._device == "cuda":
-                # The caching allocator otherwise keeps the largest chunk's working memory
-                # (~1 GB on a long chunk) reserved for good; releasing it costs no measurable time.
-                torch.cuda.empty_cache()
+        self._active = 0  # generations in progress, counted on the event loop
+        self._locked_model = _LockedModel(self)
 
     async def _iterate_off_loop(self, results):
-        """Step a pipeline generator in a worker thread so the event loop keeps serving."""
+        """Step a pipeline generator in a worker thread so the event loop keeps serving.
+
+        Only the model call itself takes the inference lock (see _LockedModel); the pipeline's
+        own bookkeeping, such as the final step that only reports it's finished, doesn't wait
+        behind another request's model call.
+        """
         done = object()
+        self._active += 1
         try:
-            while (
-                result := await asyncio.to_thread(self._next_locked, results, done)
-            ) is not done:
+            while (result := await asyncio.to_thread(next, results, done)) is not done:
                 yield result
         finally:
-            await asyncio.to_thread(self._release_cache)
+            self._active -= 1
+            if self._active == 0 and self._device == "cuda":
+                # The caching allocator otherwise keeps the largest chunk's working memory
+                # (~1 GB on a long chunk) reserved for good. Released once nothing is generating,
+                # not after every chunk, which would make busy periods pay to reallocate it.
+                await asyncio.to_thread(torch.cuda.empty_cache)
 
     async def _get_voice_tensor(self, voice_path: str) -> torch.Tensor:
         """Load voice tensor with in-memory caching to avoid repeated file I/O.
@@ -382,7 +397,10 @@ class KokoroV1(BaseModelBackend):
             )
             async for result in self._iterate_off_loop(
                 pipeline.generate_from_tokens(
-                    tokens=tokens, voice=voice_pack, speed=speed, model=self._model
+                    tokens=tokens,
+                    voice=voice_pack,
+                    speed=speed,
+                    model=self._locked_model,
                 )
             ):
                 if result.audio is not None:
@@ -427,7 +445,7 @@ class KokoroV1(BaseModelBackend):
                 spans.append((word, inside[0], inside[-1]))
 
         def render(context, row):
-            out = self._model(context, pack[row - 1], speed, return_output=True)
+            out = self._locked_model(context, pack[row - 1], speed, return_output=True)
             return out.audio.float().numpy(), out.pred_dur.numpy()
 
         filtered = "".join(ps[i] for i in kept)
@@ -536,7 +554,7 @@ class KokoroV1(BaseModelBackend):
                     tokens=phonemes.tokens or phonemes.phonemes,
                     voice=voice_pack,
                     speed=speed,
-                    model=self._model,
+                    model=self._locked_model,
                 )
             ):
                 if result.audio is not None:
