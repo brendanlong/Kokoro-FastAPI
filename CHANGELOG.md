@@ -11,6 +11,7 @@ Per-PR attribution and contributor credits are published automatically on the co
 
 ### Changed
 - Text is generated one sentence at a time, so first audio arrives after the first sentence instead of after ~175-250 tokens' worth of text (5.4 s to 2.7 s for an article opening with a 20-word sentence, on 2 CPU cores). `TARGET_MIN_TOKENS` and `TARGET_MAX_TOKENS` are gone
+- A clause too long for one chunk is no longer cut between words, which sounded like a pause mid-phrase: it's rendered in overlapping pieces, each with the words around it, and joined mid-word-gap. `ABSOLUTE_MAX_TOKENS` now sets the piece size
 - Each sentence is phonemized once, by the voice's own language, instead of a second time with US English espeak just to count tokens. Chunk sizes for non-English text are now measured correctly
 - uvicorn (the server) bumped 0.34 to 0.54: websocket messages over 16 MB are refused, keepalive pings drop connections to clients that vanish
 

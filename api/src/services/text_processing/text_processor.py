@@ -136,46 +136,12 @@ def join_lines(text: str) -> str:
     return " ".join(paragraphs)
 
 
-def split_words(text: str, max_tokens: int, lang_code: str) -> List[Phonemes]:
-    """Cut a run of words into pieces that each fit in max_tokens phonemes."""
-    words = []
-    for index, segment in enumerate(CUSTOM_PHONEMES.split(text)):
-        words.extend([segment] if index % 2 else segment.split())
-    pieces = []
-    while words:
-        low = _longest_fit(
-            len(words), lambda n: " ".join(words[:n]), max_tokens, lang_code
-        )
-        piece = phonemize(" ".join(words[:low]), lang_code)
-        word = words[0]
-        if (
-            low == 1
-            and len(piece.phonemes) > max_tokens
-            and not CUSTOM_PHONEMES.fullmatch(word)
-        ):
-            # One "word" too long on its own: Chinese and Japanese have no spaces to cut at
-            cut = _longest_fit(len(word) - 1, lambda n: word[:n], max_tokens, lang_code)
-            words = [word[:cut], word[cut:], *words[1:]]
-            continue
-        pieces.append(piece)
-        words = words[low:]
-    return pieces
+def split_clauses(sentence: str, lang_code: str) -> Iterator[Phonemes]:
+    """Cut an oversized sentence at clause punctuation.
 
-
-def _longest_fit(most: int, piece, max_tokens: int, lang_code: str) -> int:
-    """The largest n in 1..most whose piece(n) phonemizes within max_tokens, or 1."""
-    low, high = 1, most
-    while low < high:
-        mid = (low + high + 1) // 2
-        if len(phonemize(piece(mid), lang_code).phonemes) <= max_tokens:
-            low = mid
-        else:
-            high = mid - 1
-    return low
-
-
-def split_clauses(sentence: str, max_tokens: int, lang_code: str) -> Iterator[Phonemes]:
-    """Cut an oversized sentence at clause punctuation, then by words where a clause still does not fit."""
+    A clause that's still too long stays whole: generation renders it in overlapping pieces,
+    which a cut between words here would make sound like a pause.
+    """
     clauses = re.split(r"([,;:，、；：])", sentence)
     for index in range(0, len(clauses), 2):
         clause = clauses[index].strip()
@@ -183,11 +149,7 @@ def split_clauses(sentence: str, max_tokens: int, lang_code: str) -> Iterator[Ph
             continue
         if index + 1 < len(clauses):
             clause += clauses[index + 1]
-        phonemes = phonemize(clause, lang_code)
-        if len(phonemes.phonemes) <= max_tokens:
-            yield phonemes
-        else:
-            yield from split_words(clause, max_tokens, lang_code)
+        yield phonemize(clause, lang_code)
 
 
 def pack(
@@ -237,13 +199,11 @@ def sentences(text: str) -> Iterator[str]:
 
 
 def sentence_chunks(sentence: str, max_tokens: int, lang_code: str) -> List[Phonemes]:
-    """A sentence as one chunk, or split where it has to be: at clauses, then between words."""
+    """A sentence as one chunk, or split at its clauses if it's too long."""
     phonemes = phonemize(sentence, lang_code)
     if len(phonemes.phonemes) <= max_tokens:
         return [phonemes]
-    return list(
-        pack(split_clauses(sentence, max_tokens, lang_code), max_tokens, lang_code)
-    )
+    return list(pack(split_clauses(sentence, lang_code), max_tokens, lang_code))
 
 
 async def smart_split(

@@ -245,15 +245,12 @@ async def test_smart_custom_phenomes():
 
 @pytest.mark.asyncio
 async def test_smart_split_only_phenomes():
-    """Test input that is entirely made of phenome annotations (pr #350)."""
+    """Input made entirely of phoneme annotations stays one chunk (pr #350)."""
     text = "[Kokoro](/kˈOkəɹO/) [Misaki 1.2](/misˈɑki/) [Test](/tɛst/)"
     chunks = [c async for c in smart_split(text, max_tokens=10)]
 
-    assert [c for c, _, _ in chunks] == [
-        "[Kokoro](/kˈOkəɹO/)",
-        "[Misaki 1.2](/misˈɑki/)",
-        "[Test](/tɛst/)",
-    ]
+    assert [c for c, _, _ in chunks] == [text]
+    assert chunks[0][1].phonemes == "kˈOkəɹO misˈɑki tɛst"
 
 
 @pytest.mark.asyncio
@@ -537,37 +534,18 @@ def sizes(pieces):
     return [(p.text, len(p.phonemes)) for p in pieces]
 
 
-def test_split_words_fits_each_piece(fake_g2p):
-    assert sizes(text_processor.split_words("a b c d e", 3, "a")) == [
-        ("a b", 3),
-        ("c d", 3),
-        ("e", 1),
-    ]
-    assert sizes(text_processor.split_words("abcdef gh", 3, "a")) == [
-        ("abc", 3),
-        ("def", 3),
-        ("gh", 2),
-    ]
-    assert sizes(text_processor.split_words("a [b c](/d/) e", 3, "a")) == [
-        ("a", 1),
-        ("[b c](/d/)", 10),
-        ("e", 1),
-    ]
-
-
-def test_split_clauses_keeps_separators_and_falls_back_to_words(fake_g2p):
-    assert sizes(text_processor.split_clauses("a b, c d; e", 5, "a")) == [
+def test_split_clauses_keeps_separators_and_long_clauses_whole(fake_g2p):
+    """A clause that's still too long isn't cut between words: generation stitches it."""
+    assert sizes(text_processor.split_clauses("a b, c d; e", "a")) == [
         ("a b,", 4),
         ("c d;", 4),
         ("e", 1),
     ]
-    assert sizes(text_processor.split_clauses("abcdefgh ij, k", 5, "a")) == [
-        ("abcde", 5),
-        ("fgh", 3),
-        ("ij,", 3),
+    assert sizes(text_processor.split_clauses("abcdefgh ij, k", "a")) == [
+        ("abcdefgh ij,", 12),
         ("k", 1),
     ]
-    assert sizes(text_processor.split_clauses("a,, b", 5, "a")) == [
+    assert sizes(text_processor.split_clauses("a,, b", "a")) == [
         ("a,", 2),
         ("b", 1),
     ]
@@ -584,7 +562,7 @@ def test_oversized_sentence_packs_its_clauses(fake_g2p):
 
 @pytest.mark.asyncio
 async def test_smart_split_caps_unpunctuated_runs():
-    """A long run with no punctuation is cut by words, never truncated by the model (issue #71, #95)."""
+    """A long run with no punctuation stays one chunk for generation to stitch, never truncated (issue #71, #95)."""
     text = "hello\n" * 100
     chunks = [
         (c, p)
@@ -593,12 +571,9 @@ async def test_smart_split_caps_unpunctuated_runs():
         )
     ]
 
-    assert " ".join(c for c, _ in chunks).split() == ["hello"] * 100
-    assert all(
-        len(p.phonemes) <= text_processor.settings.absolute_max_tokens
-        for _, p in chunks
-    )
-    assert len(chunks) == 2
+    assert len(chunks) == 1
+    assert chunks[0][0].split() == ["hello"] * 100
+    assert len(chunks[0][1].phonemes) > text_processor.settings.absolute_max_tokens
 
 
 @pytest.mark.asyncio
@@ -629,17 +604,13 @@ async def test_smart_split_normalize_off_still_joins_lines():
 
 
 @pytest.mark.asyncio
-async def test_long_chinese_sentence_without_commas_fits_the_model():
-    """No spaces to cut at, so it's cut between characters rather than failing the request."""
+async def test_long_chinese_sentence_without_commas_stays_one_chunk():
+    """No clause to cut at: generation renders it in overlapping pieces instead of failing."""
     text = "我们今天早上一起去公园散步然后在湖边看到很多人在跑步和打太极拳" * 4 + "。"
     chunks = [c async for c in smart_split(text, lang_code="z")]
 
-    assert len(chunks) > 1
-    assert "".join(c for c, _, _ in chunks) == text
-    assert all(
-        len(p.phonemes) <= text_processor.settings.absolute_max_tokens
-        for _, p, _ in chunks
-    )
+    assert [c for c, _, _ in chunks] == [text]
+    assert len(chunks[0][1].phonemes) > text_processor.settings.absolute_max_tokens
 
 
 def test_phonemize_english_keeps_the_words_for_timestamps():
