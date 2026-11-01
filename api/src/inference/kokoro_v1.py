@@ -125,7 +125,9 @@ def _compile(model: KModel) -> None:
     """
     AdaINResBlock1.forward = _resblock_forward
     generator = model.decoder.generator
-    # Compiled in fp16, the sine excitation (a running phase sum fed to sin) gave NaNs for some lengths
+    # Inductor bug (torch 2.8 through 2.14): Triton kernels get float constants at 15 digits, so
+    # SineGen's interpolate(scale_factor=1/300) length comes out one short inside kernels but not on
+    # the host. Buffers end up partly unwritten and the audio NaN. Kept eager until that's fixed.
     generator.m_source.forward = torch.compiler.disable(generator.m_source.forward)
     model.bert = torch.compile(model.bert, dynamic=True)
     model.text_encoder = torch.compile(model.text_encoder, dynamic=True)
