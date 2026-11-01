@@ -10,6 +10,7 @@ Per-PR attribution and contributor credits are published automatically on the co
 - ElevenLabs and Cartesia compatible websocket TTS, for voice agent frameworks (Pipecat, LiveKit Agents etc): point their ElevenLabs/Cartesia plugin at Kokoro, streamed text in, PCM (or MP3) audio out with word timestamps, any common sample rate
 
 ### Changed
+- Encoding audio (MP3, Opus etc) no longer pauses other requests on the same server while it runs
 - uvicorn (the server) bumped 0.34 to 0.54: websocket messages over 16 MB are refused, keepalive pings drop connections to clients that vanish
 
 ### Fixed

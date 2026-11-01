@@ -12,6 +12,7 @@ from scipy.signal import resample_poly
 
 from ..core.config import settings
 from ..structures.schemas import clamp_rate
+from .audio import run_off_loop
 from .streaming_audio_writer import StreamingAudioWriter
 from .tts_service import TTSService
 
@@ -124,7 +125,7 @@ class SpeechContext:
         try:
             while (text := await self.queue.get()) is not None:
                 offset = await self._speak(text, offset)
-            tail = self.writer.write_chunk(finalize=True)
+            tail = await run_off_loop(self.writer.write_chunk, finalize=True)
             if tail:
                 await self._emit(tail, offset)
             await self.emit_done()
@@ -146,6 +147,9 @@ class SpeechContext:
         self.unsent_words, self.unsent_start = [], end
         await self.emit_audio(data, words, start, end - start)
 
+    def _encode(self, audio: np.ndarray) -> bytes:
+        return self.writer.write_chunk(resample(audio, self.sample_rate))
+
     async def _speak(self, text: str, offset: float) -> float:
         call_start = offset
         async for chunk in self.tts_service.generate_audio_stream(
@@ -159,7 +163,7 @@ class SpeechContext:
             if not chunk.output:
                 continue
             audio = np.frombuffer(chunk.output, dtype=np.int16)
-            data = self.writer.write_chunk(resample(audio, self.sample_rate))
+            data = await run_off_loop(self._encode, audio)
             words = self.unsent_words
             for w in chunk.word_timestamps or []:
                 start, end = call_start + w.start_time, call_start + w.end_time
