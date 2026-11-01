@@ -2,13 +2,12 @@ import time
 
 import pytest
 
+from api.src.inference.g2p import Phonemes
 from api.src.services.text_processing import text_processor
 from api.src.services.text_processing.normalization import Normalizer
 from api.src.services.text_processing.text_processor import (
     check_speakable,
-    get_sentence_info,
     join_lines,
-    process_text_chunk,
     smart_split,
     split_by_voice,
     strip_emoji,
@@ -23,8 +22,25 @@ class ShoutingNormalizer(Normalizer):
         return text.upper()
 
 
+def fake_phonemize(text: str, lang_code: str) -> Phonemes:
+    """One phoneme per character, so chunk sizes are easy to reason about."""
+    return Phonemes(text, text)
+
+
 @pytest.fixture
-def shouting_language(monkeypatch):
+def fake_g2p(monkeypatch):
+    calls = []
+
+    def phonemize(text, lang_code):
+        calls.append(text)
+        return fake_phonemize(text, lang_code)
+
+    monkeypatch.setattr(text_processor, "phonemize", phonemize)
+    return calls
+
+
+@pytest.fixture
+def shouting_language(monkeypatch, fake_g2p):
     registry = {"xx": ShoutingNormalizer()}
     monkeypatch.setattr(text_processor, "get_normalizer", registry.get)
     monkeypatch.setattr(text_processor.settings, "advanced_text_normalization", True)
@@ -128,45 +144,30 @@ def test_strip_emoji_flood_is_fast():
     assert time.monotonic() - start < 2.0
 
 
-def test_process_text_chunk_basic():
-    """Test basic text chunk processing."""
-    text = "Hello world"
-    tokens = process_text_chunk(text)
-    assert isinstance(tokens, list)
-    assert len(tokens) > 0
+@pytest.mark.asyncio
+async def test_smart_split_phonemizes_each_sentence_once(fake_g2p):
+    chunks = [c async for c in smart_split("One here. Two here!", lang_code="a")]
+
+    assert [(text, phonemes.phonemes) for text, phonemes, _ in chunks] == [
+        ("One here.", "One here."),
+        ("Two here!", "Two here!"),
+    ]
+    assert fake_g2p == ["One here.", "Two here!"]
 
 
-def test_process_text_chunk_empty():
-    """Test processing empty text."""
-    text = ""
-    tokens = process_text_chunk(text)
-    assert isinstance(tokens, list)
-    assert len(tokens) == 0
+@pytest.mark.asyncio
+async def test_smart_split_uses_the_languages_own_phonemes():
+    """English phonemes come from misaki, with the words kept for timestamps."""
+    chunks = [c async for c in smart_split("Hello world.", lang_code="a")]
+
+    assert len(chunks) == 1
+    phonemes = chunks[0][1]
+    assert phonemes.phonemes == "həlˈO wˈɜɹld."
+    assert [t.text for t in phonemes.tokens] == ["Hello", "world", "."]
 
 
-def test_process_text_chunk_phonemes():
-    """Test processing with skip_phonemize."""
-    phonemes = "h @ l @U"  # Example phoneme sequence
-    tokens = process_text_chunk(phonemes, skip_phonemize=True)
-    assert isinstance(tokens, list)
-    assert len(tokens) > 0
-
-
-def test_get_sentence_info():
-    """Test sentence splitting and info extraction."""
-    text = "This is sentence one. This is sentence two! What about three?"
-    results = list(get_sentence_info(text))
-
-    assert len(results) == 3
-    for sentence, tokens, count in results:
-        assert isinstance(sentence, str)
-        assert isinstance(tokens, list)
-        assert isinstance(count, int)
-        assert count == len(tokens)
-        assert count > 0
-
-
-def test_get_sentence_info_abbreviations():
+@pytest.mark.asyncio
+async def test_smart_split_abbreviations_are_not_sentence_breaks(fake_g2p):
     """Abbreviations, decimals, and ellipses do not force bogus sentence breaks (issue #308, pr #520)."""
     text = (
         "This, that, the other thing, etc. Another sentence... A, b, c, etc., and "
@@ -176,7 +177,12 @@ def test_get_sentence_info_abbreviations():
         "keep well. Data (Eastern Harbor vs. outer harbor) may vary. Keep that in mind."
     )
 
-    sentences = [s for s, _, _ in get_sentence_info(text)]
+    sentences = [
+        c
+        async for c, _, _ in smart_split(
+            text, normalization_options=NormalizationOptions(normalize=False)
+        )
+    ]
 
     assert sentences == [
         "This, that, the other thing, etc.",
@@ -196,41 +202,9 @@ def test_get_sentence_info_abbreviations():
     ]
 
 
-def test_get_sentence_info_is_lazy(monkeypatch):
-    """Sentences are phonemized as they are pulled, not all up front (pr #513)."""
-    calls = []
-
-    def counting_process_text_chunk(text, *args, **kwargs):
-        calls.append(text)
-        return [1, 2, 3]
-
-    monkeypatch.setattr(
-        text_processor, "process_text_chunk", counting_process_text_chunk
-    )
-
-    sentences = text_processor.get_sentence_info("One. Two. Three.")
-    assert calls == []
-
-    assert next(sentences)[0] == "One."
-    assert calls == ["One."]
-
-    next(sentences)
-    assert calls == ["One.", "Two."]
-
-
 @pytest.mark.asyncio
-async def test_smart_split_first_chunk_skips_rest_of_text(monkeypatch):
+async def test_smart_split_first_chunk_skips_rest_of_text(fake_g2p):
     """Time to first chunk stays flat: it must not phonemize the whole input (pr #513)."""
-    calls = []
-
-    def counting_process_text_chunk(text, *args, **kwargs):
-        calls.append(text)
-        return [1] * 200
-
-    monkeypatch.setattr(
-        text_processor, "process_text_chunk", counting_process_text_chunk
-    )
-
     text = " ".join(f"This is sentence {i}." for i in range(200))
     chunks = text_processor.smart_split(text)
     try:
@@ -238,7 +212,7 @@ async def test_smart_split_first_chunk_skips_rest_of_text(monkeypatch):
     finally:
         await chunks.aclose()
 
-    assert len(calls) < 10
+    assert fake_g2p == ["This is sentence zero."]
 
 
 @pytest.mark.asyncio
@@ -246,43 +220,34 @@ async def test_smart_split_short_text():
     """Test smart splitting with text under max tokens."""
     text = "This is a short test sentence."
     chunks = []
-    async for chunk_text, chunk_tokens, _ in smart_split(text):
-        chunks.append((chunk_text, chunk_tokens))
+    async for chunk_text, phonemes, _ in smart_split(text):
+        chunks.append((chunk_text, phonemes))
 
     assert len(chunks) == 1
-    assert isinstance(chunks[0][0], str)
-    assert isinstance(chunks[0][1], list)
+    assert chunks[0][0] == text
+    assert chunks[0][1].phonemes
 
 
 @pytest.mark.asyncio
 async def test_smart_custom_phenomes():
     """Custom phoneme tags survive splitting (issue #348, pr #350)."""
     text = "This is a short test sentence. [Kokoro](/kˈOkəɹO/) has a feature called custom phenomes. This is made possible by [Misaki](/misˈɑki/), the custom phenomizer that [Kokoro](/kˈOkəɹO/) version 1.0 uses"
-    chunks = []
-    async for chunk_text, chunk_tokens, pause_duration in smart_split(text):
-        chunks.append((chunk_text, chunk_tokens, pause_duration))
+    chunks = [c async for c in smart_split(text)]
 
-    # Should have 1 chunks: text
-    assert len(chunks) == 1
-
-    # First chunk: text
-    assert chunks[0][2] is None  # No pause
-    assert (
-        "This is a short test sentence. [Kokoro](/kˈOkəɹO/) has a feature called custom phenomes. This is made possible by [Misaki](/misˈɑki/), the custom phenomizer that [Kokoro](/kˈOkəɹO/) version one uses"
-        in chunks[0][0]
-    )
-    assert len(chunks[0][1]) > 0
+    assert [c for c, _, _ in chunks] == [
+        "This is a short test sentence.",
+        "[Kokoro](/kˈOkəɹO/) has a feature called custom phenomes.",
+        "This is made possible by [Misaki](/misˈɑki/), the custom phenomizer that [Kokoro](/kˈOkəɹO/) version one uses",
+    ]
+    assert chunks[1][1].phonemes.startswith("kˈOkəɹO ")
+    assert "misˈɑki" in chunks[2][1].phonemes
 
 
 @pytest.mark.asyncio
 async def test_smart_split_only_phenomes():
     """Test input that is entirely made of phenome annotations (pr #350)."""
     text = "[Kokoro](/kˈOkəɹO/) [Misaki 1.2](/misˈɑki/) [Test](/tɛst/)"
-    chunks = []
-    async for chunk_text, chunk_tokens, pause_duration in smart_split(
-        text, max_tokens=10
-    ):
-        chunks.append((chunk_text, chunk_tokens, pause_duration))
+    chunks = [c async for c in smart_split(text, max_tokens=10)]
 
     assert [c for c, _, _ in chunks] == [
         "[Kokoro](/kˈOkəɹO/)",
@@ -297,15 +262,10 @@ async def test_smart_split_long_text():
     # Create text that should split into multiple chunks
     text = ". ".join(["This is test sentence number " + str(i) for i in range(20)])
 
-    chunks = []
-    async for chunk_text, chunk_tokens, _ in smart_split(text):
-        chunks.append((chunk_text, chunk_tokens))
+    chunks = [c async for c in smart_split(text)]
 
-    assert len(chunks) > 1
-    for chunk_text, chunk_tokens in chunks:
-        assert isinstance(chunk_text, str)
-        assert isinstance(chunk_tokens, list)
-        assert len(chunk_tokens) > 0
+    assert len(chunks) == 20
+    assert all(chunk_text and phonemes.phonemes for chunk_text, phonemes, _ in chunks)
 
 
 @pytest.mark.asyncio
@@ -321,39 +281,29 @@ async def test_smart_split_with_punctuation():
     assert all(any(p in chunk for p in "!?;:.") for chunk in chunks)
 
 
-def test_process_text_chunk_chinese_phonemes():
-    """Test processing with Chinese pinyin phonemes."""
-    pinyin = "nǐ hǎo lì"  # Example pinyin sequence with tones
-    tokens = process_text_chunk(pinyin, skip_phonemize=True, language="z")
-    assert isinstance(tokens, list)
-    assert len(tokens) > 0
-
-
-def test_get_sentence_info_chinese():
-    """Test Chinese sentence splitting and info extraction (pr #321)."""
+@pytest.mark.asyncio
+async def test_smart_split_chinese_sentences():
+    """Chinese splits at its own sentence punctuation (pr #321)."""
     text = "这是一个句子。这是第二个句子！第三个问题？"
-    results = list(get_sentence_info(text, lang_code="z"))
+    chunks = [c async for c in smart_split(text, lang_code="z")]
 
-    assert len(results) == 3
-    for sentence, tokens, count in results:
-        assert isinstance(sentence, str)
-        assert isinstance(tokens, list)
-        assert isinstance(count, int)
-        assert count == len(tokens)
-        assert count > 0
+    assert [c for c, _, _ in chunks] == [
+        "这是一个句子。",
+        "这是第二个句子！",
+        "第三个问题？",
+    ]
+    assert all(phonemes.phonemes for _, phonemes, _ in chunks)
 
 
 @pytest.mark.asyncio
 async def test_smart_split_chinese_short():
     """Test Chinese smart splitting with short text (pr #321)."""
     text = "这是一句话。"
-    chunks = []
-    async for chunk_text, chunk_tokens, _ in smart_split(text, lang_code="z"):
-        chunks.append((chunk_text, chunk_tokens))
+    chunks = [c async for c in smart_split(text, lang_code="z")]
 
     assert len(chunks) == 1
-    assert isinstance(chunks[0][0], str)
-    assert isinstance(chunks[0][1], list)
+    assert chunks[0][0] == text
+    assert chunks[0][1].phonemes
 
 
 @pytest.mark.asyncio
@@ -361,15 +311,10 @@ async def test_smart_split_chinese_long():
     """Test Chinese smart splitting with longer text (pr #321)."""
     text = "。".join([f"测试句子 {i}" for i in range(20)])
 
-    chunks = []
-    async for chunk_text, chunk_tokens, _ in smart_split(text, lang_code="z"):
-        chunks.append((chunk_text, chunk_tokens))
+    chunks = [c async for c in smart_split(text, lang_code="z")]
 
-    assert len(chunks) > 1
-    for chunk_text, chunk_tokens in chunks:
-        assert isinstance(chunk_text, str)
-        assert isinstance(chunk_tokens, list)
-        assert len(chunk_tokens) > 0
+    assert len(chunks) == 20
+    assert all(chunk_text and phonemes.phonemes for chunk_text, phonemes, _ in chunks)
 
 
 @pytest.mark.asyncio
@@ -391,8 +336,8 @@ async def test_smart_split_with_pause():
     text = "Hello world [pause:2.5s] How are you?"
 
     chunks = []
-    async for chunk_text, chunk_tokens, pause_duration in smart_split(text):
-        chunks.append((chunk_text, chunk_tokens, pause_duration))
+    async for chunk_text, phonemes, pause_duration in smart_split(text):
+        chunks.append((chunk_text, phonemes, pause_duration))
 
     # Should have 3 chunks: text, pause, text
     assert len(chunks) == 3
@@ -400,17 +345,17 @@ async def test_smart_split_with_pause():
     # First chunk: text
     assert chunks[0][2] is None  # No pause
     assert "Hello world" in chunks[0][0]
-    assert len(chunks[0][1]) > 0
+    assert chunks[0][1].phonemes
 
     # Second chunk: pause
     assert chunks[1][2] == 2.5  # 2.5 second pause
     assert chunks[1][0] == ""  # Empty text
-    assert len(chunks[1][1]) == 0  # No tokens
+    assert chunks[1][1] is None
 
     # Third chunk: text
     assert chunks[2][2] is None  # No pause
     assert "How are you?" in chunks[2][0]
-    assert len(chunks[2][1]) > 0
+    assert chunks[2][1].phonemes
 
 
 @pytest.mark.asyncio
@@ -419,8 +364,8 @@ async def test_smart_split_with_two_pause():
     text = "[pause:0.5s][pause:1.67s]0.5"
 
     chunks = []
-    async for chunk_text, chunk_tokens, pause_duration in smart_split(text):
-        chunks.append((chunk_text, chunk_tokens, pause_duration))
+    async for chunk_text, phonemes, pause_duration in smart_split(text):
+        chunks.append((chunk_text, phonemes, pause_duration))
 
     # Should have 3 chunks: pause, pause, text
     assert len(chunks) == 3
@@ -428,17 +373,17 @@ async def test_smart_split_with_two_pause():
     # First chunk: pause
     assert chunks[0][2] == 0.5  # 0.5 second pause
     assert chunks[0][0] == ""  # Empty text
-    assert len(chunks[0][1]) == 0
+    assert chunks[0][1] is None
 
     # Second chunk: pause
     assert chunks[1][2] == 1.67  # 1.67 second pause
     assert chunks[1][0] == ""  # Empty text
-    assert len(chunks[1][1]) == 0  # No tokens
+    assert chunks[1][1] is None
 
     # Third chunk: text
     assert chunks[2][2] is None  # No pause
     assert "zero point five" in chunks[2][0]
-    assert len(chunks[2][1]) > 0
+    assert chunks[2][1].phonemes
 
 
 def test_split_by_voice_no_tags():
@@ -588,45 +533,52 @@ def test_join_lines(text, expected):
     assert join_lines(text) == expected
 
 
-def test_split_words_fits_each_piece(monkeypatch):
-    monkeypatch.setattr(
-        text_processor, "process_text_chunk", lambda text, *a, **k: [0] * len(text)
-    )
-
-    assert text_processor.split_words("a b c d e", 3) == [
-        ("a b", [0, 0, 0]),
-        ("c d", [0, 0, 0]),
-        ("e", [0]),
-    ]
-    assert text_processor.split_words("abcdef gh", 3) == [
-        ("abcdef", [0] * 6),
-        ("gh", [0, 0]),
-    ]
-    assert text_processor.split_words("a [b c](/d/) e", 3) == [
-        ("a", [0]),
-        ("[b c](/d/)", [0] * 10),
-        ("e", [0]),
-    ]
+def sizes(pieces):
+    return [(p.text, len(p.phonemes)) for p in pieces]
 
 
-def test_split_clauses_keeps_separators_and_falls_back_to_words(monkeypatch):
-    monkeypatch.setattr(
-        text_processor, "process_text_chunk", lambda text, *a, **k: [0] * len(text)
-    )
+def test_split_words_fits_each_piece(fake_g2p):
+    assert sizes(text_processor.split_words("a b c d e", 3, "a")) == [
+        ("a b", 3),
+        ("c d", 3),
+        ("e", 1),
+    ]
+    assert sizes(text_processor.split_words("abcdef gh", 3, "a")) == [
+        ("abc", 3),
+        ("def", 3),
+        ("gh", 2),
+    ]
+    assert sizes(text_processor.split_words("a [b c](/d/) e", 3, "a")) == [
+        ("a", 1),
+        ("[b c](/d/)", 10),
+        ("e", 1),
+    ]
 
-    assert list(text_processor.split_clauses("a b, c d; e", 5)) == [
-        ("a b,", [0] * 4),
-        ("c d;", [0] * 4),
-        ("e", [0]),
+
+def test_split_clauses_keeps_separators_and_falls_back_to_words(fake_g2p):
+    assert sizes(text_processor.split_clauses("a b, c d; e", 5, "a")) == [
+        ("a b,", 4),
+        ("c d;", 4),
+        ("e", 1),
     ]
-    assert list(text_processor.split_clauses("abcdefgh ij, k", 5)) == [
-        ("abcdefgh", [0] * 8),
-        ("ij,", [0] * 3),
-        ("k", [0]),
+    assert sizes(text_processor.split_clauses("abcdefgh ij, k", 5, "a")) == [
+        ("abcde", 5),
+        ("fgh", 3),
+        ("ij,", 3),
+        ("k", 1),
     ]
-    assert list(text_processor.split_clauses("a,, b", 5)) == [
-        ("a,", [0, 0]),
-        ("b", [0]),
+    assert sizes(text_processor.split_clauses("a,, b", 5, "a")) == [
+        ("a,", 2),
+        ("b", 1),
+    ]
+
+
+def test_oversized_sentence_packs_its_clauses(fake_g2p):
+    """A sentence over the cap is cut into as few pieces as fit, at clause punctuation first."""
+    sentence = "aaaa, bbbb, cccc, dddd."
+    assert sizes(text_processor.sentence_chunks(sentence, 12, "a")) == [
+        ("aaaa, bbbb,", 11),
+        ("cccc, dddd.", 11),
     ]
 
 
@@ -635,24 +587,27 @@ async def test_smart_split_caps_unpunctuated_runs():
     """A long run with no punctuation is cut by words, never truncated by the model (issue #71, #95)."""
     text = "hello\n" * 100
     chunks = [
-        (c, t)
-        async for c, t, _ in smart_split(
+        (c, p)
+        async for c, p, _ in smart_split(
             text, normalization_options=NormalizationOptions(normalize=False)
         )
     ]
 
     assert " ".join(c for c, _ in chunks).split() == ["hello"] * 100
-    assert all(len(t) <= text_processor.settings.absolute_max_tokens for _, t in chunks)
+    assert all(
+        len(p.phonemes) <= text_processor.settings.absolute_max_tokens
+        for _, p in chunks
+    )
     assert len(chunks) == 2
 
 
 @pytest.mark.asyncio
 async def test_smart_split_paragraph_break_is_a_sentence_boundary():
-    """A blank line reads as a sentence break and still packs into one chunk (issue #519)."""
+    """A blank line reads as a sentence break (issue #519)."""
     text = "Steven Erikson\n\nFive riders drew rein in the pass."
     chunks = [c async for c, _, _ in smart_split(text)]
 
-    assert chunks == ["Steven Erikson. Five riders drew rein in the pass."]
+    assert chunks == ["Steven Erikson.", "Five riders drew rein in the pass."]
 
 
 @pytest.mark.asyncio
@@ -666,4 +621,45 @@ async def test_smart_split_normalize_off_still_joins_lines():
         )
     ]
 
-    assert chunks == ["Steven Erikson. Five riders drew rein in the pass. Then 3 more."]
+    assert chunks == [
+        "Steven Erikson.",
+        "Five riders drew rein in the pass.",
+        "Then 3 more.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_long_chinese_sentence_without_commas_fits_the_model():
+    """No spaces to cut at, so it's cut between characters rather than failing the request."""
+    text = "我们今天早上一起去公园散步然后在湖边看到很多人在跑步和打太极拳" * 4 + "。"
+    chunks = [c async for c in smart_split(text, lang_code="z")]
+
+    assert len(chunks) > 1
+    assert "".join(c for c, _, _ in chunks) == text
+    assert all(
+        len(p.phonemes) <= text_processor.settings.absolute_max_tokens
+        for _, p, _ in chunks
+    )
+
+
+def test_phonemize_english_keeps_the_words_for_timestamps():
+    from api.src.inference import g2p
+
+    phonemes = g2p.phonemize("Hi there.", "a")
+    assert phonemes.phonemes == "hˈI ðˈɛɹ."
+    assert [t.text for t in phonemes.tokens] == ["Hi", "there", "."]
+    assert g2p.phonemize("", "a").phonemes == ""
+    assert g2p.phonemize("hola", "e").tokens is None
+
+
+@pytest.mark.asyncio
+async def test_sentence_split_keeps_custom_pronunciations_whole():
+    """An annotation's text can end a "sentence" ([Hello! World]), but must reach G2P in one piece."""
+    text = "Say [Hello! World](/həlˈO wˈɜɹld/) again. Then stop."
+    chunks = [c async for c in smart_split(text)]
+
+    assert [c for c, _, _ in chunks] == [
+        "Say [Hello! World](/həlˈO wˈɜɹld/) again.",
+        "Then stop.",
+    ]
+    assert "həlˈO wˈɜɹld" in chunks[0][1].phonemes

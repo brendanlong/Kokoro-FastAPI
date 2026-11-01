@@ -387,9 +387,11 @@ async def test_generate_from_phonemes_uses_default_voice_code():
     model_manager = AsyncMock()
     model_manager.hold = MagicMock(return_value=noop_hold())
     backend = MagicMock(spec=KokoroV1)
-    backend._get_pipeline.return_value.generate_from_tokens.return_value = [
-        MagicMock(audio=torch.zeros(4))
-    ]
+
+    async def generate_from_tokens(*args, **kwargs):
+        yield np.zeros(4, dtype=np.float32)
+
+    backend.generate_from_tokens = MagicMock(side_effect=generate_from_tokens)
     model_manager.get_backend = MagicMock(return_value=backend)
 
     with (
@@ -404,9 +406,10 @@ async def test_generate_from_phonemes_uses_default_voice_code():
         service = await TTSService.create()
         service.get_voices_path = AsyncMock(return_value=("ursa", "/path/to/ursa.pt"))
 
-        await service.generate_from_phonemes("h@lˈO", "ursa")
+        audio, _ = await service.generate_from_phonemes("h@lˈO", "ursa")
 
-        backend._get_pipeline.assert_called_once_with("a")
+        assert len(audio) == 4
+        assert backend.generate_from_tokens.call_args.kwargs["lang_code"] == "a"
 
 
 async def _stubbed_service():
@@ -645,7 +648,7 @@ async def test_failed_chunk_raises_instead_of_dropping_speech():
     """A chunk that fails to generate must fail the request, not vanish from a 200."""
     model_manager = AsyncMock()
     model_manager.get_backend = MagicMock()
-    model_manager.generate.side_effect = RuntimeError("model failed")
+    model_manager.generate = MagicMock(side_effect=RuntimeError("model failed"))
     with (
         patch("api.src.services.tts_service.get_model_manager") as mock_get_model,
         patch("api.src.services.tts_service.get_voice_manager") as mock_get_voice,
