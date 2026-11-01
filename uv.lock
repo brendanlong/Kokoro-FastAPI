@@ -1388,7 +1388,7 @@ wheels = [
 [[package]]
 name = "kokoro"
 version = "0.9.4"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/brendanlong/kokoro?rev=d85a2660b33d7c59f0195eaa35be0d7cffb495d5#d85a2660b33d7c59f0195eaa35be0d7cffb495d5" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "loguru" },
@@ -1402,10 +1402,6 @@ dependencies = [
     { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-14-kokoro-fastapi-gpu') or (platform_machine == 'aarch64' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-gpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-gpu' and extra == 'extra-14-kokoro-fastapi-rocm') or (extra == 'extra-14-kokoro-fastapi-gpu-cu128' and extra == 'extra-14-kokoro-fastapi-rocm') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-rocm')" },
     { name = "torch", version = "2.8.0+rocm6.4", source = { registry = "https://download.pytorch.org/whl/rocm6.4" }, marker = "(extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-gpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra != 'extra-14-kokoro-fastapi-gpu-cu128' and extra == 'extra-14-kokoro-fastapi-rocm') or (extra != 'extra-14-kokoro-fastapi-cpu' and extra != 'extra-14-kokoro-fastapi-gpu' and extra == 'extra-14-kokoro-fastapi-rocm')" },
     { name = "transformers" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e8/48/88b8cdf28b068d070195c2817175549dee48e7682e3ab8994bee5f69217e/kokoro-0.9.4.tar.gz", hash = "sha256:fbf633262797f8cf46fdac3315cf9cade67dc8b762c0feccf334892772fb9ac4", size = 26215928, upload-time = "2025-04-05T22:01:35.294Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ea/cc/75f41633c75224ba820a4533163bc8b070b6bf25416014074c63284c2d4e/kokoro-0.9.4-py3-none-any.whl", hash = "sha256:a129dc6364a286bd6a92c396e9862459d3d3e45f2c15596ed5a94dcee5789efd", size = 32592, upload-time = "2025-04-05T22:01:23.018Z" },
 ]
 
 [[package]]
@@ -1496,7 +1492,7 @@ requires-dist = [
     { name = "inflect", specifier = ">=7.5.0" },
     { name = "inno-kokoro", specifier = "==0.2.0" },
     { name = "jinja2", marker = "extra == 'test'", specifier = ">=3.1.6" },
-    { name = "kokoro", specifier = "==0.9.4" },
+    { name = "kokoro", git = "https://github.com/brendanlong/kokoro?rev=d85a2660b33d7c59f0195eaa35be0d7cffb495d5" },
     { name = "loguru", specifier = "==0.7.3" },
     { name = "misaki", extras = ["en", "ja", "ko", "zh"], specifier = "==0.9.4" },
     { name = "munch", specifier = "==4.0.0" },
@@ -2781,11 +2777,11 @@ name = "pyopenjtalk-plus"
 version = "0.4.1.post9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", marker = "sys_platform != 'darwin' or extra != 'extra-14-kokoro-fastapi-cpu' or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-rocm')" },
-    { name = "pydantic", marker = "sys_platform != 'darwin' or extra != 'extra-14-kokoro-fastapi-cpu' or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-rocm')" },
-    { name = "sudachidict-core", marker = "sys_platform != 'darwin' or extra != 'extra-14-kokoro-fastapi-cpu' or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-rocm')" },
-    { name = "sudachipy", marker = "sys_platform != 'darwin' or extra != 'extra-14-kokoro-fastapi-cpu' or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-rocm')" },
-    { name = "typing-extensions", marker = "sys_platform != 'darwin' or extra != 'extra-14-kokoro-fastapi-cpu' or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-rocm')" },
+    { name = "numpy", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-rocm') or (sys_platform == 'darwin' and extra != 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-rocm')" },
+    { name = "pydantic", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-rocm') or (sys_platform == 'darwin' and extra != 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-rocm')" },
+    { name = "sudachidict-core", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-rocm') or (sys_platform == 'darwin' and extra != 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-rocm')" },
+    { name = "sudachipy", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-rocm') or (sys_platform == 'darwin' and extra != 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-rocm')" },
+    { name = "typing-extensions", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-rocm') or (sys_platform == 'darwin' and extra != 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-rocm')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1a/e7/03cc1d971260ae90cc35370965d6d8e612cc8b8588d2f81db7cd2accf9ad/pyopenjtalk_plus-0.4.1.post9.tar.gz", hash = "sha256:cdcb0746659857554c6dad23956cad77e21f76c9f3dfa000ea2f8d4f0ba11d99", size = 25023543, upload-time = "2026-08-11T21:13:31.021Z" }
 wheels = [
@@ -3676,7 +3672,7 @@ name = "sudachidict-core"
 version = "20260723"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "sudachipy", marker = "sys_platform != 'darwin' or extra != 'extra-14-kokoro-fastapi-cpu' or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (extra == 'extra-14-kokoro-fastapi-cpu' and extra == 'extra-14-kokoro-fastapi-rocm')" },
+    { name = "sudachipy", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'darwin' and extra == 'extra-14-kokoro-fastapi-rocm') or (sys_platform == 'darwin' and extra != 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-cpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-gpu-cu128') or (sys_platform == 'linux' and extra == 'extra-14-kokoro-fastapi-rocm')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2f/69/e8df4402744319080f9db9f20dc40a0cc3f2042db82ab7c040b785becf14/sudachidict_core-20260723.tar.gz", hash = "sha256:d50c302f907c0bb9b048b9d224abc3b24cdbeb8416a73942de00b74235798fe7", size = 9119, upload-time = "2026-07-24T05:40:57.315Z" }
 wheels = [
