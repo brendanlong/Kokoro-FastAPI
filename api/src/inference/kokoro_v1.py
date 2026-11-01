@@ -138,13 +138,24 @@ class KokoroV1(BaseModelBackend):
         with self._inference_lock:
             return next(results, done)
 
+    def _release_cache(self):
+        # Under the lock, so a step still running in its thread finishes first
+        with self._inference_lock:
+            if self._device == "cuda":
+                # The caching allocator otherwise keeps the largest chunk's working memory
+                # (~1 GB on a long chunk) reserved for good; releasing it costs no measurable time.
+                torch.cuda.empty_cache()
+
     async def _iterate_off_loop(self, results):
         """Step a pipeline generator in a worker thread so the event loop keeps serving."""
         done = object()
-        while (
-            result := await asyncio.to_thread(self._next_locked, results, done)
-        ) is not done:
-            yield result
+        try:
+            while (
+                result := await asyncio.to_thread(self._next_locked, results, done)
+            ) is not done:
+                yield result
+        finally:
+            await asyncio.to_thread(self._release_cache)
 
     async def _get_voice_tensor(self, voice_path: str) -> torch.Tensor:
         """Load voice tensor with in-memory caching to avoid repeated file I/O.

@@ -11,6 +11,7 @@ Per-PR attribution and contributor credits are published automatically on the co
 
 ### Changed
 - The model takes ~220 MB less memory on CPU, and skips recomputing every layer's weights on each call
+- On NVIDIA GPUs the server holds ~0.5 GB of GPU memory between requests, instead of keeping the most a long chunk ever needed (up to ~1.7 GB)
 - uvicorn (the server) bumped 0.34 to 0.54: websocket messages over 16 MB are refused, keepalive pings drop connections to clients that vanish
 
 ### Fixed

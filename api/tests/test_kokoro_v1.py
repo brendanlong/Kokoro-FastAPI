@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
@@ -495,3 +496,36 @@ def test_bake_weight_norm_keeps_output_and_drops_the_split_weights():
     assert torch.allclose(before, after, atol=1e-6)
     assert not any(hasattr(m, "weight_g") for m in model.modules())
     assert sum(p.numel() for p in model.parameters()) == 8 * 4 * 3 + 8 + 6 * 10 + 6
+
+
+@pytest.mark.parametrize(("device", "releases"), [("cuda", True), ("cpu", False)])
+@pytest.mark.parametrize("read_all", [True, False])
+async def test_generation_releases_cached_gpu_memory(
+    device, releases, read_all, kokoro_backend
+):
+    """Released when a generation finishes, or when its reader stops early (a disconnect)."""
+    kokoro_backend._model = MagicMock()
+    mock_pipeline = MagicMock(
+        side_effect=lambda *args, **kwargs: iter([_audio_result(), _audio_result()])
+    )
+    with (
+        patch.object(kokoro_backend, "_device", device),
+        patch.object(kokoro_backend, "_check_memory", return_value=False),
+        patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
+        patch("api.src.core.paths.save_voice_tensor"),
+        patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline),
+        patch("torch.cuda.empty_cache") as empty_cache,
+    ):
+        stream = kokoro_backend.generate("test", "af_voice")
+        if read_all:
+            chunks = [c async for c in stream]
+            assert len(chunks) == 2
+        else:
+            await anext(stream)
+            await stream.aclose()
+            # the inner stream is finalized by the event loop once the outer one lets go of it
+            for _ in range(20):
+                if empty_cache.called:
+                    break
+                await asyncio.sleep(0.01)
+    assert empty_cache.called == releases
