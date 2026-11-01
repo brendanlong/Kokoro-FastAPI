@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -529,3 +530,63 @@ async def test_generation_releases_cached_gpu_memory(
                     break
                 await asyncio.sleep(0.01)
     assert empty_cache.called == releases
+
+
+async def test_cuda_generation_runs_in_fp16_and_returns_fp32_audio(kokoro_backend):
+    """Half-precision on the GPU, but callers still get float32 audio to scale and encode."""
+    import contextlib
+
+    kokoro_backend._model = MagicMock()
+    autocasts = []
+
+    def fake_autocast(device_type, dtype=None, enabled=True):
+        autocasts.append((device_type, dtype, enabled))
+        return contextlib.nullcontext()
+
+    def run(*args, **kwargs):
+        yield SimpleNamespace(
+            audio=torch.full((4,), 0.5, dtype=torch.float16), tokens=None, phonemes=None
+        )
+
+    with (
+        patch.object(kokoro_backend, "_device", "cuda"),
+        patch.object(kokoro_backend, "_half", True),
+        patch.object(kokoro_backend, "_check_memory", return_value=False),
+        patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
+        patch("api.src.core.paths.save_voice_tensor"),
+        patch(
+            "api.src.inference.kokoro_v1.KPipeline",
+            return_value=MagicMock(side_effect=run),
+        ),
+        patch("api.src.inference.kokoro_v1.torch.autocast", side_effect=fake_autocast),
+        patch("torch.cuda.empty_cache"),
+    ):
+        chunks = [c async for c in kokoro_backend.generate("test", "af_voice")]
+    assert ("cuda", torch.float16, True) in autocasts
+    assert chunks[0].audio.dtype == np.float32
+
+
+@pytest.mark.parametrize(
+    ("capability", "half"), [((8, 6), True), ((7, 0), True), ((6, 1), False)]
+)
+async def test_cuda_load_uses_fp16_only_with_tensor_cores(
+    capability, half, kokoro_backend
+):
+    """Maxwell and Pascal cards run fp16 far slower than fp32, so they stay in fp32."""
+    model = MagicMock()
+    model.eval.return_value = model
+    model.cuda.return_value = model
+    with (
+        patch.object(kokoro_backend, "_device", "cuda"),
+        patch("api.src.inference.kokoro_v1.KModel", return_value=model),
+        patch("api.src.inference.kokoro_v1._bake_weight_norm"),
+        patch(
+            "api.src.inference.kokoro_v1.paths.get_model_path",
+            return_value="/m/kokoro-v1_0.pth",
+        ),
+        patch("api.src.inference.kokoro_v1.aiofiles.os.path.exists", return_value=True),
+        patch("torch.cuda.get_device_capability", return_value=capability),
+    ):
+        await kokoro_backend.load_model("kokoro-v1_0.pth")
+    assert kokoro_backend._half == half
+    assert model.half.called == half
