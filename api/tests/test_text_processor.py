@@ -663,3 +663,19 @@ async def test_sentence_split_keeps_custom_pronunciations_whole():
         "Then stop.",
     ]
     assert "həlˈO wˈɜɹld" in chunks[0][1].phonemes
+
+
+def test_english_voice_reads_other_scripts_in_their_own_language():
+    """Not "Chinese letter Chinese letter": each script goes to its own language's G2P."""
+    from api.src.inference import g2p
+
+    chinese = g2p.phonemize("We had dinner in 北京 last year.", "a")
+    assert "bˈeiʨˈiŋ" in chinese.phonemes
+    assert "lˈɛtəɹ" not in chinese.phonemes
+    assert "北京" in [t.text for t in chinese.tokens]
+
+    russian = g2p.phonemize("The word Москва means Moscow.", "a")
+    assert "mʌskvˈɑ" in russian.phonemes
+
+    punctuation = g2p.phonemize("He said 你好，世界！ and left.", "a")
+    assert ", " in punctuation.phonemes and "!" in punctuation.phonemes
