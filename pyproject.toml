@@ -36,7 +36,7 @@ dependencies = [
     "espeakng-loader==0.2.4",
     # brendanlong/kokoro deploy branch: other scripts read with their own language's G2P
     # (hexgrad/kokoro#387 plus Mandarin tones), the torch.compile and exact-iSTFT fixes
-    "kokoro @ git+https://github.com/brendanlong/kokoro@50ea02a749f1913591f5b2aa673cd29ecc1bf49c",
+    "kokoro @ git+https://github.com/brendanlong/kokoro@66c8ed5108f39470c75dff01280f9fc2c9ccd521",
     "transformers>=5.5.0,<6",
     "misaki[en,ja,ko,zh]==0.9.4",
     "pyopenjtalk-plus>=0.4.1 ; sys_platform == 'win32'",

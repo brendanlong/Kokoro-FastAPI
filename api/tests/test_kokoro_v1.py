@@ -498,26 +498,6 @@ def test_configure_rocm_backend_opt_out(restore_cudnn, monkeypatch):
     assert torch.backends.cudnn.enabled is True
 
 
-def test_bake_weight_norm_keeps_output_and_drops_the_split_weights():
-    from api.src.inference.kokoro_v1 import _bake_weight_norm
-
-    torch.manual_seed(0)
-    model = torch.nn.Sequential(
-        torch.nn.utils.weight_norm(torch.nn.Conv1d(4, 8, 3, padding=1)),
-        torch.nn.ReLU(),
-        torch.nn.utils.weight_norm(torch.nn.Linear(10, 6)),
-    ).eval()
-    x = torch.randn(2, 4, 10)
-    with torch.no_grad():
-        before = model(x)
-        _bake_weight_norm(model)
-        after = model(x)
-
-    assert torch.allclose(before, after, atol=1e-6)
-    assert not any(hasattr(m, "weight_g") for m in model.modules())
-    assert sum(p.numel() for p in model.parameters()) == 8 * 4 * 3 + 8 + 6 * 10 + 6
-
-
 @pytest.mark.parametrize(("device", "releases"), [("cuda", True), ("cpu", False)])
 @pytest.mark.parametrize("read_all", [True, False])
 async def test_generation_releases_cached_gpu_memory(
@@ -602,7 +582,6 @@ async def test_cuda_load_uses_fp16_and_compile_only_where_supported(
     with (
         patch.object(kokoro_backend, "_device", "cuda"),
         patch("api.src.inference.kokoro_v1.KModel", return_value=model),
-        patch("api.src.inference.kokoro_v1._bake_weight_norm"),
         patch(
             "api.src.inference.kokoro_v1.paths.get_model_path",
             return_value="/m/kokoro-v1_0.pth",
@@ -635,27 +614,12 @@ def _small_generator():
     ).eval()
 
 
-def test_resblock_forward_traces_as_one_graph_with_the_same_output():
-    from kokoro.istftnet import AdaINResBlock1
-
-    from api.src.inference.kokoro_v1 import _resblock_forward
-
-    torch.manual_seed(0)
+def test_generator_traces_as_one_graph():
+    """_compile relies on kokoro's decoder compiling whole, sine source included."""
     generator = _small_generator()
     x, s, f0 = torch.randn(1, 512, 10), torch.randn(1, 128), torch.rand(1, 10) * 200
-    original = AdaINResBlock1.forward
-    try:
-        with torch.no_grad():
-            torch.manual_seed(1)
-            before = generator(x, s, f0)
-            AdaINResBlock1.forward = _resblock_forward
-            torch.manual_seed(1)
-            after = generator(x, s, f0)
-            breaks = torch._dynamo.explain(generator)(x, s, f0).graph_break_count
-    finally:
-        AdaINResBlock1.forward = original
-    assert torch.equal(before, after)
-    assert breaks == 0
+    with torch.no_grad():
+        assert torch._dynamo.explain(generator)(x, s, f0).graph_break_count == 0
 
 
 def test_unload_frees_a_model_caught_in_a_reference_cycle(kokoro_backend):
