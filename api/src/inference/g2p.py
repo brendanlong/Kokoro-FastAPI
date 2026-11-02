@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from kokoro import KPipeline
+from kokoro.foreign import CJK_PUNCTUATION
 from misaki.en import MToken
 
 from ..core.config import settings
@@ -42,9 +43,19 @@ def raw(text: str, lang_code: str):
 
 
 def phonemize(text: str, lang_code: str) -> Phonemes:
-    """Blocking; call off the event loop."""
-    ps, tokens = raw(text, lang_code)
-    if pipeline(lang_code).lang_code in "ab":
+    """Blocking; call off the event loop.
+
+    Runs of other scripts (Chinese in English text, say) are read by their own language's G2P
+    in this voice, rather than as symbol names like "Chinese letter".
+    """
+    p = pipeline(lang_code)
+    graphemes = text if p.lang_code in "jz" else text.translate(CJK_PUNCTUATION)
+    with _locks[lang_code]:
+        if p.lang_code in "ab":
+            tokens = p.en_g2p_tokens(graphemes)
+        else:
+            ps = p.g2p_phonemes(graphemes)
+    if p.lang_code in "ab":
         for token in tokens:
             token.phonemes = token.phonemes or ""
         return Phonemes(text, KPipeline.tokens_to_ps(tokens), tokens)
