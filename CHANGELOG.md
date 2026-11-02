@@ -10,6 +10,14 @@ Per-PR attribution and contributor credits are published automatically on the co
 - ElevenLabs and Cartesia compatible websocket TTS, for voice agent frameworks (Pipecat, LiveKit Agents etc): point their ElevenLabs/Cartesia plugin at Kokoro, streamed text in, PCM (or MP3) audio out with word timestamps, any common sample rate
 
 ### Changed
+- Encoding audio (MP3, Opus etc) no longer pauses other requests on the same server while it runs
+- The model takes ~220 MB less memory on CPU, and skips recomputing every layer's weights on each call
+- On NVIDIA GPUs the server holds ~0.5 GB of GPU memory between requests, instead of keeping the most a long chunk ever needed (up to ~1.7 GB)
+- GPU generation runs in half precision on cards with tensor cores (compute capability 7.0+, e.g. RTX 20-series and newer): 20-25% faster and about half the GPU memory, with no audible difference
+- GPU generation is compiled with `torch.compile` on NVIDIA cards that support it (compute capability 7.0+): about twice the throughput and faster first audio, for a ~45 s longer startup
+- Text is generated one sentence at a time, so first audio arrives after the first sentence instead of after ~175-250 tokens' worth of text (5.4 s to 2.7 s for an article opening with a 20-word sentence, on 2 CPU cores). `TARGET_MIN_TOKENS` and `TARGET_MAX_TOKENS` are gone
+- A clause too long for one chunk is no longer cut between words, which sounded like a pause mid-phrase: it's rendered in overlapping pieces, each with the words around it, and joined mid-word-gap. `ABSOLUTE_MAX_TOKENS` now sets the piece size
+- Each sentence is phonemized once, by the voice's own language, instead of a second time with US English espeak just to count tokens. Chunk sizes for non-English text are now measured correctly
 - uvicorn (the server) bumped 0.34 to 0.54: websocket messages over 16 MB are refused, keepalive pings drop connections to clients that vanish
 
 ### Fixed

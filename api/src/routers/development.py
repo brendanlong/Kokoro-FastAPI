@@ -1,13 +1,14 @@
+import asyncio
 import base64
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from kokoro import KPipeline
 from loguru import logger
 
 from ..core.config import settings
+from ..inference import g2p
 from ..inference.model_manager import ModelBusyError
-from ..services.audio import AudioNormalizer
+from ..services.audio import AudioNormalizer, run_off_loop
 from ..services.streaming_audio_writer import StreamingAudioWriter
 from ..services.text_processing.text_processor import (
     check_pause_budget,
@@ -60,15 +61,13 @@ async def phonemize_text(request: PhonemeRequest) -> PhonemeResponse:
         if not request.text:
             raise ValueError("Text cannot be empty")
 
-        # Initialize Kokoro pipeline in quiet mode (no model)
-        pipeline = KPipeline(
-            lang_code=request.language, repo_id=settings.model_repo_id, model=False
+        # The same G2P generation uses, off the event loop
+        phonemes = await asyncio.to_thread(
+            g2p.phonemize, request.text, request.language
         )
-
-        phonemes = [result.phonemes for result in pipeline(request.text)]
-        if not phonemes:
+        if not phonemes.phonemes:
             raise ValueError("Failed to generate phonemes")
-        return PhonemeResponse(phonemes=" ".join(phonemes), tokens=[])
+        return PhonemeResponse(phonemes=phonemes.phonemes, tokens=[])
     except ValueError as e:
         logger.warning(f"Invalid phoneme request: {str(e)}")
         raise HTTPException(
@@ -118,12 +117,14 @@ async def generate_from_phonemes(
                     # Normalize audio before writing
                     normalized_audio = normalizer.normalize(chunk_audio)
                     # Write chunk and yield bytes
-                    chunk_bytes = writer.write_chunk(normalized_audio)
+                    chunk_bytes = await run_off_loop(
+                        writer.write_chunk, normalized_audio
+                    )
                     if chunk_bytes:
                         yield chunk_bytes
 
                     # Finalize and yield remaining bytes
-                    final_bytes = writer.write_chunk(finalize=True)
+                    final_bytes = await run_off_loop(writer.write_chunk, finalize=True)
                     if final_bytes:
                         yield final_bytes
                 else:

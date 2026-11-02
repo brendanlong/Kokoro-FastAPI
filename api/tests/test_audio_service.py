@@ -1,6 +1,8 @@
 """Tests for AudioService"""
 
+import asyncio
 import io
+import threading
 from unittest.mock import patch
 
 import av
@@ -8,7 +10,7 @@ import numpy as np
 import pytest
 
 from api.src.inference.base import AudioChunk
-from api.src.services.audio import AudioService
+from api.src.services.audio import AudioNormalizer, AudioService
 from api.src.services.streaming_audio_writer import StreamingAudioWriter
 
 
@@ -239,3 +241,97 @@ def test_finalize_preserves_tail(format):
     else:
         # lossy encoders pad with encoder delay, but must not truncate
         assert decoded >= 2 * len(audio)
+
+
+def test_trim_keeps_the_sound_and_pads_its_edges(mock_settings):
+    mock_settings.dynamic_gap_trim_padding_ms = 410
+    mock_settings.dynamic_gap_trim_padding_char_multiplier = {".": 1}
+    rate = 24000
+    tone = (np.sin(np.arange(rate // 5) / 5) * 20000).astype(np.int16)
+    silence = np.zeros(rate // 2, np.int16)
+    audio = np.concatenate([silence, tone, silence])
+
+    normalizer = AudioNormalizer()
+    start, end = normalizer.find_first_last_non_silent(audio, "Hi.", 1.0)
+
+    loud = np.flatnonzero(np.abs(audio.astype(np.int32)) > 32767 * 10 ** (-45 / 20))
+    assert start == loud[0] - normalizer.samples_to_pad_start
+    assert end == loud[-1] + int(0.41 * rate) - normalizer.samples_to_pad_start
+
+
+def test_trim_leaves_all_silent_audio_alone(mock_settings):
+    mock_settings.dynamic_gap_trim_padding_ms = 410
+    mock_settings.dynamic_gap_trim_padding_char_multiplier = {}
+    audio = np.zeros(4800, np.int16)
+    assert AudioNormalizer().find_first_last_non_silent(audio, "", 1.0) == (0, 4800)
+
+
+def _blocking_writer(sample_rate):
+    """A writer whose write_chunk parks in its thread until released, recording when it finishes."""
+    writer = StreamingAudioWriter("pcm", sample_rate=sample_rate)
+    started, release, events = threading.Event(), threading.Event(), []
+
+    def write_chunk(*args, **kwargs):
+        started.set()
+        release.wait(5)
+        events.append("write finished")
+        return b"x"
+
+    writer.write_chunk = write_chunk
+    return writer, started, release, events
+
+
+@pytest.mark.asyncio
+async def test_convert_audio_does_not_block_the_event_loop(sample_audio):
+    """Encoding runs in a thread, so other requests keep being served meanwhile."""
+    audio_data, sample_rate = sample_audio
+    writer, started, release, _ = _blocking_writer(sample_rate)
+
+    task = asyncio.create_task(
+        AudioService.convert_audio(
+            AudioChunk(audio_data), "pcm", writer, trim_audio=False
+        )
+    )
+    await asyncio.to_thread(started.wait, 5)
+    # The encode is parked in its thread; this coroutine still gets to run.
+    assert not task.done()
+    release.set()
+    assert (await task).output == b"x"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_convert_audio_waits_for_its_encode(sample_audio):
+    """A disconnect cancels the request, which then closes the writer: that must not happen mid-write."""
+    audio_data, sample_rate = sample_audio
+    writer, started, release, events = _blocking_writer(sample_rate)
+
+    async def request():
+        try:
+            await AudioService.convert_audio(
+                AudioChunk(audio_data), "pcm", writer, trim_audio=False
+            )
+        finally:
+            events.append("writer closed")
+
+    task = asyncio.create_task(request())
+    await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == ["write finished", "writer closed"]
+
+
+def test_trim_handles_the_most_negative_sample(mock_settings):
+    mock_settings.dynamic_gap_trim_padding_ms = 0
+    mock_settings.dynamic_gap_trim_padding_char_multiplier = {}
+    for dtype in (np.int16, np.int32):
+        audio = np.zeros(4800, dtype)
+        audio[2400] = np.iinfo(dtype).min
+        normalizer = AudioNormalizer()
+        normalizer.samples_to_pad_start = 0
+        assert normalizer.find_first_last_non_silent(
+            audio, "", 1.0, is_last_chunk=True
+        ) == (2400, 2400)

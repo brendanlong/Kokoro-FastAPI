@@ -1,9 +1,9 @@
 """Unified text processing for TTS with smart chunking."""
 
+import asyncio
 import math
 import re
 import time
-from itertools import groupby
 from typing import AsyncGenerator, Iterable, Iterator, List, Optional, Tuple
 
 import regex
@@ -11,16 +11,16 @@ from loguru import logger
 from unicode_segmentation_rs import unicode_sentences
 
 from ...core.config import settings
+from ...inference.g2p import Phonemes, phonemize
 from ...structures.schemas import VOICE_NAME_BODY, NormalizationOptions, clamp_rate
 from .normalization import get_normalizer
-from .phonemizer import phonemize
-from .vocabulary import tokenize
 
 # Pre-compiled regex patterns for performance
 # Updated regex to be more strict and avoid matching isolated brackets
 # Only matches complete patterns like [word](/ipa/) and prevents catastrophic backtracking
 CUSTOM_PHONEMES = re.compile(r"(\[[^\[\]]*?\]\(\/[^\/\(\)]*?\/\))")
 # Pattern to find pause tags like [pause:0.5s]
+ANNOTATION_MARK = re.compile(".\ue000(\\d+)\ue001")
 PAUSE_TAG_PATTERN = re.compile(r"\[pause:(\d+(?:\.\d+)?)s\]", re.IGNORECASE)
 EMOJI_PATTERN = regex.compile(
     r" ?(?:[0-9#*]\uFE0F?\u20E3|[\p{Extended_Pictographic}\p{Regional_Indicator}]"
@@ -36,57 +36,6 @@ CONTROL_TAG_PATTERN = re.compile(
     rf"\[voice:\s*({VOICE_NAME_BODY}?)\s*\]|\[rate:\s*(\d+(?:\.\d+)?)\s*\]|\[baserate:\s*(\d+(?:\.\d+)?)\s*\]",
     re.IGNORECASE,
 )
-
-
-def process_text_chunk(
-    text: str, language: str = "a", skip_phonemize: bool = False
-) -> List[int]:
-    """Process a chunk of text through normalization, phonemization, and tokenization.
-
-    Args:
-        text: Text chunk to process
-        language: Language code for phonemization
-        skip_phonemize: If True, treat input as phonemes and skip normalization/phonemization
-
-    Returns:
-        List of token IDs
-    """
-    start_time = time.time()
-
-    # Strip input text to remove any leading/trailing spaces that could cause artifacts
-    text = text.strip()
-
-    if not text:
-        return []
-
-    if skip_phonemize:
-        # Input is already phonemes, just tokenize
-        tokens = tokenize(text)
-    else:
-        # Normal text processing pipeline
-        phonemes = phonemize(text, language)
-        # Strip phonemes result to ensure no extra spaces
-        phonemes = phonemes.strip()
-        tokens = tokenize(phonemes)
-
-    total_time = time.time() - start_time
-    logger.debug(
-        f"Total processing took {total_time * 1000:.2f}ms for chunk: '{text[:50]}{'...' if len(text) > 50 else ''}'"
-    )
-
-    return tokens
-
-
-def get_sentence_info(
-    text: str, lang_code: str = "a"
-) -> Iterator[Tuple[str, List[int], int]]:
-    """Yield (sentence, tokens, token_count) per sentence, phonemizing lazily."""
-    for sentence in unicode_sentences(text):
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        tokens = process_text_chunk(sentence)
-        yield sentence, tokens, len(tokens)
 
 
 def split_by_voice(text: str, default_voice: str) -> List[Tuple[str, float, str]]:
@@ -187,28 +136,12 @@ def join_lines(text: str) -> str:
     return " ".join(paragraphs)
 
 
-def split_words(text: str, max_tokens: int) -> List[Tuple[str, List[int]]]:
-    """Cut a run of words into pieces that each fit in max_tokens."""
-    words = []
-    for index, segment in enumerate(CUSTOM_PHONEMES.split(text)):
-        words.extend([segment] if index % 2 else segment.split())
-    pieces = []
-    while words:
-        low, high = 1, len(words)
-        while low < high:
-            mid = (low + high + 1) // 2
-            if len(process_text_chunk(" ".join(words[:mid]))) <= max_tokens:
-                low = mid
-            else:
-                high = mid - 1
-        piece = " ".join(words[:low])
-        pieces.append((piece, process_text_chunk(piece)))
-        words = words[low:]
-    return pieces
+def split_clauses(sentence: str, lang_code: str) -> Iterator[Phonemes]:
+    """Cut an oversized sentence at clause punctuation.
 
-
-def split_clauses(sentence: str, max_tokens: int) -> Iterator[Tuple[str, List[int]]]:
-    """Cut an oversized sentence at clause punctuation, then by words where a clause still does not fit."""
+    A clause that's still too long stays whole: generation renders it in overlapping pieces,
+    which a cut between words here would make sound like a pause.
+    """
     clauses = re.split(r"([,;:，、；：])", sentence)
     for index in range(0, len(clauses), 2):
         clause = clauses[index].strip()
@@ -216,58 +149,61 @@ def split_clauses(sentence: str, max_tokens: int) -> Iterator[Tuple[str, List[in
             continue
         if index + 1 < len(clauses):
             clause += clauses[index + 1]
-        tokens = process_text_chunk(clause)
-        if len(tokens) <= max_tokens:
-            yield clause, tokens
-        else:
-            yield from split_words(clause, max_tokens)
+        yield phonemize(clause, lang_code)
 
 
 def pack(
-    pieces: Iterable[Tuple[str, List[int]]],
-    max_tokens: int,
-    min_tokens: int,
-    target_max: int,
-) -> Iterator[Tuple[str, List[int]]]:
-    """Greedy packer: fill to target_max, run past it up to max_tokens only while under min_tokens."""
-    target_max = min(target_max, max_tokens)
-    chunk: List[str] = []
-    chunk_tokens: List[int] = []
-    for text, tokens in pieces:
-        total = len(chunk_tokens) + len(tokens)
-        if total <= target_max or (
-            total <= max_tokens and len(chunk_tokens) < min_tokens
-        ):
-            chunk.append(text)
-            chunk_tokens.extend(tokens)
-            continue
-        if chunk:
-            yield " ".join(chunk).strip(), chunk_tokens
-        chunk, chunk_tokens = [text], list(tokens)
-    if chunk:
-        yield " ".join(chunk).strip(), chunk_tokens
+    pieces: Iterable[Phonemes], max_tokens: int, lang_code: str
+) -> Iterator[Phonemes]:
+    """Join consecutive pieces while their phonemes fit in max_tokens, so a split sentence has as few seams as possible."""
+    group: List[Phonemes] = []
+    size = 0
+    for piece in pieces:
+        if group and size + 1 + len(piece.phonemes) > max_tokens:
+            yield _join(group, lang_code)
+            group, size = [], 0
+        size += len(piece.phonemes) + (1 if group else 0)
+        group.append(piece)
+    if group:
+        yield _join(group, lang_code)
 
 
-def chunk_sentences(
-    sentences: Iterable[Tuple[str, List[int], int]], max_tokens: int
-) -> Iterator[Tuple[str, List[int]]]:
-    """Pack sentences into chunks. An oversized sentence is packed alone from its clauses."""
-    for oversized, group in groupby(sentences, key=lambda item: item[2] > max_tokens):
-        if oversized:
-            for sentence, _, _ in group:
-                yield from pack(
-                    split_clauses(sentence, max_tokens),
-                    max_tokens,
-                    0,
-                    settings.target_max_tokens,
-                )
-        else:
-            yield from pack(
-                ((sentence, tokens) for sentence, tokens, _ in group),
-                max_tokens,
-                settings.target_min_tokens,
-                settings.target_max_tokens,
-            )
+def _join(group: List[Phonemes], lang_code: str) -> Phonemes:
+    # Phonemized whole, as G2P reads a word differently with its neighbours. The model takes up to 510
+    # phonemes, so the few that can shift past max_tokens this way still fit.
+    return (
+        group[0]
+        if len(group) == 1
+        else phonemize(" ".join(p.text for p in group), lang_code)
+    )
+
+
+def sentences(text: str) -> Iterator[str]:
+    """Split into sentences, never inside a [word](/phonemes/) annotation, whose text may end with "!"."""
+    annotations = CUSTOM_PHONEMES.findall(text)
+
+    def mask(match, index=iter(range(len(annotations)))):
+        # Starts with the annotation's own first letter, so a capitalised one can still begin a sentence
+        first = match.group(0)[1:2]
+        return f"{first if first.isalnum() else 'x'}\ue000{next(index)}\ue001"
+
+    for sentence in unicode_sentences(CUSTOM_PHONEMES.sub(mask, text)):
+        yield ANNOTATION_MARK.sub(
+            lambda m: (
+                annotations[int(m.group(1))]
+                if int(m.group(1)) < len(annotations)
+                else m.group(0)
+            ),
+            sentence,
+        )
+
+
+def sentence_chunks(sentence: str, max_tokens: int, lang_code: str) -> List[Phonemes]:
+    """A sentence as one chunk, or split at its clauses if it's too long."""
+    phonemes = phonemize(sentence, lang_code)
+    if len(phonemes.phonemes) <= max_tokens:
+        return [phonemes]
+    return list(pack(split_clauses(sentence, lang_code), max_tokens, lang_code))
 
 
 async def smart_split(
@@ -275,13 +211,12 @@ async def smart_split(
     max_tokens: int = settings.absolute_max_tokens,
     lang_code: str = "a",
     normalization_options: NormalizationOptions = NormalizationOptions(),
-) -> AsyncGenerator[Tuple[str, List[int], Optional[float]], None]:
-    """Build optimal chunks targeting 300-400 tokens, never exceeding max_tokens.
+) -> AsyncGenerator[Tuple[str, Optional[Phonemes], Optional[float]], None]:
+    """One chunk per sentence, phonemized once, never exceeding max_tokens phonemes.
 
     Yields:
-        Tuple of (text_chunk, tokens, pause_duration_s).
-        If pause_duration_s is not None, it's a pause chunk with empty text/tokens.
-        Otherwise, it's a text chunk containing the original text.
+        Tuple of (text_chunk, phonemes, pause_duration_s).
+        If pause_duration_s is not None, it's a pause chunk with empty text and no phonemes.
     """
     start_time = time.time()
     chunk_count = 0
@@ -321,13 +256,21 @@ async def smart_split(
 
                     processed_text = "".join(processed_text).strip()
 
-            sentences = get_sentence_info(processed_text, lang_code=lang_code)
-            for chunk_text, chunk_tokens in chunk_sentences(sentences, max_tokens):
-                chunk_count += 1
-                logger.info(
-                    f"Yielding chunk {chunk_count}: '{chunk_text[:50]}{'...' if len(chunk_text) > 50 else ''}' ({len(chunk_tokens)} tokens)"
+            for sentence in sentences(processed_text):
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                chunks = await asyncio.to_thread(
+                    sentence_chunks, sentence, max_tokens, lang_code
                 )
-                yield chunk_text, chunk_tokens, None
+                for chunk in chunks:
+                    if not chunk.phonemes:
+                        continue
+                    chunk_count += 1
+                    logger.info(
+                        f"Yielding chunk {chunk_count}: '{chunk.text[:50]}{'...' if len(chunk.text) > 50 else ''}' ({len(chunk.phonemes)} phonemes)"
+                    )
+                    yield chunk.text, chunk, None
 
         # Handle Pause
         # Check if the next part is a pause duration string
@@ -340,7 +283,7 @@ async def smart_split(
                 if duration > 0:
                     chunk_count += 1
                     logger.info(f"Yielding pause chunk {chunk_count}: {duration}s")
-                    yield "", [], duration  # Yield pause chunk
+                    yield "", None, duration  # Yield pause chunk
 
     # End of parts loop
     total_time = time.time() - start_time

@@ -11,6 +11,7 @@ from loguru import logger
 from ..core import paths
 from ..core.config import settings
 from ..core.model_config import ModelConfig, model_config
+from . import g2p
 from .base import BaseModelBackend
 from .kokoro_v1 import KokoroV1
 
@@ -82,13 +83,20 @@ class ModelManager:
                 voices = await paths.list_voices()
                 voice_path = await paths.get_voice_path(settings.default_voice)
 
-                # Warm up with short text
-                warmup_text = "Warmup text for initialization."
-                # Use default voice name for warmup
                 voice_name = settings.default_voice
                 logger.debug(f"Using default voice '{voice_name}' for warmup")
-                async for _ in self.generate(warmup_text, (voice_name, voice_path)):
-                    pass
+                lang_code = settings.default_voice_code or voice_name[0].lower()
+                # Two lengths: a compiled model specialises on its first input's shape and only
+                # builds its any-length kernels on the second, which would otherwise be a user's
+                for warmup_text in (
+                    "Warmup text for initialization.",
+                    "A second, somewhat longer sentence finishes warming up the model.",
+                ):
+                    phonemes = await asyncio.to_thread(
+                        g2p.phonemize, warmup_text, lang_code
+                    )
+                    async for _ in self.generate(phonemes, (voice_name, voice_path)):
+                        pass
             except Exception as e:
                 raise RuntimeError(f"Failed to get default voice: {e}")
 

@@ -1,10 +1,13 @@
 """Clean Kokoro implementation with controlled resource management."""
 
 import asyncio
+import gc
 import os
+import re
 import threading
 from collections import OrderedDict
-from typing import AsyncGenerator, Dict, Optional, Tuple, Union
+from functools import partial
+from typing import AsyncGenerator, Optional, Tuple, Union
 
 import aiofiles.os
 import numpy as np
@@ -16,7 +19,10 @@ from ..core import paths
 from ..core.config import settings
 from ..core.model_config import model_config
 from ..structures.schemas import WordTimestamp
+from . import g2p
 from .base import AudioChunk, BaseModelBackend
+from .g2p import Phonemes
+from .stitching import render_stitched
 
 # Distinct voices and mixes held in memory; each is about half a megabyte
 VOICE_CACHE_SIZE = 64
@@ -87,6 +93,45 @@ def _espeak_word_timestamps(graphemes, phonemes, pred_dur, g2p=None):
         return None
 
 
+def _compile(model: KModel) -> None:
+    """torch.compile the model's fixed-graph stages, around the data-dependent duration step.
+
+    In fp16 on an RTX 3060 Ti a typical sentence goes from ~89 ms to ~50 ms. Kernels are
+    shape-generic (dynamic=True), so new lengths don't recompile once warmed up.
+    """
+    model.bert = torch.compile(model.bert, dynamic=True)
+    model.text_encoder = torch.compile(model.text_encoder, dynamic=True)
+    model.predictor.F0Ntrain = torch.compile(model.predictor.F0Ntrain, dynamic=True)
+    model.decoder = torch.compile(model.decoder, dynamic=True)
+
+
+def _word_spans(phonemes: Phonemes):
+    """(word, first phoneme index, last phoneme index) for each word with phonemes.
+
+    English has its misaki tokens; other languages pair the text's words with the
+    space-separated phoneme groups, when the counts agree.
+    """
+    spans = []
+    if phonemes.tokens is not None:
+        raw = "".join(
+            t.phonemes + (" " if t.whitespace else "") for t in phonemes.tokens
+        )
+        offset = len(raw) - len(raw.lstrip())  # tokens_to_ps strips the joined string
+        position = -offset
+        for token in phonemes.tokens:
+            if token.text.strip() and token.phonemes and position >= 0:
+                spans.append(
+                    (token.text.strip(), position, position + len(token.phonemes) - 1)
+                )
+            position += len(token.phonemes) + (1 if token.whitespace else 0)
+        return spans
+    groups = [(m.start(), m.end() - 1) for m in re.finditer(r"\S+", phonemes.phonemes)]
+    words = phonemes.text.split()
+    if len(groups) != len(words):
+        return []
+    return [(word, first, last) for word, (first, last) in zip(words, groups)]
+
+
 def _configure_rocm_backend() -> None:
     """Disable MIOpen on ROCm.
 
@@ -107,6 +152,25 @@ def _configure_rocm_backend() -> None:
     logger.info("ROCm detected: MIOpen disabled to avoid per-shape kernel compilation")
 
 
+class _LockedModel:
+    """The model as KPipeline calls it, one call at a time and at the backend's precision."""
+
+    def __init__(self, backend: "KokoroV1"):
+        self._backend = backend
+
+    @property
+    def device(self):
+        return self._backend._model.device
+
+    def __call__(self, *args, **kwargs):
+        backend = self._backend
+        with (
+            backend._inference_lock,
+            torch.autocast("cuda", dtype=torch.float16, enabled=backend._half),
+        ):
+            return backend._model(*args, **kwargs)
+
+
 class KokoroV1(BaseModelBackend):
     """Kokoro backend with controlled resource management."""
 
@@ -116,23 +180,33 @@ class KokoroV1(BaseModelBackend):
         # Strictly respect settings.use_gpu
         self._device = settings.get_device()
         self._model: Optional[KModel] = None
-        self._pipelines: Dict[str, KPipeline] = {}  # Store pipelines by lang_code
         self._voice_cache: OrderedDict[str, torch.Tensor] = (
             OrderedDict()
         )  # LRU of voice tensors by path
         self._inference_lock = threading.Lock()  # one model call at a time
-
-    def _next_locked(self, results, done):
-        with self._inference_lock:
-            return next(results, done)
+        self._half = False
+        self._active = 0  # generations in progress, counted on the event loop
+        self._locked_model = _LockedModel(self)
 
     async def _iterate_off_loop(self, results):
-        """Step a pipeline generator in a worker thread so the event loop keeps serving."""
+        """Step a pipeline generator in a worker thread so the event loop keeps serving.
+
+        Only the model call itself takes the inference lock (see _LockedModel); the pipeline's
+        own bookkeeping, such as the final step that only reports it's finished, doesn't wait
+        behind another request's model call.
+        """
         done = object()
-        while (
-            result := await asyncio.to_thread(self._next_locked, results, done)
-        ) is not done:
-            yield result
+        self._active += 1
+        try:
+            while (result := await asyncio.to_thread(next, results, done)) is not done:
+                yield result
+        finally:
+            self._active -= 1
+            if self._active == 0 and self._device == "cuda":
+                # The caching allocator otherwise keeps the largest chunk's working memory
+                # (~1 GB on a long chunk) reserved for good. Released once nothing is generating,
+                # not after every chunk, which would make busy periods pay to reallocate it.
+                await asyncio.to_thread(torch.cuda.empty_cache)
 
     async def _get_voice_tensor(self, voice_path: str) -> torch.Tensor:
         """Load voice tensor with in-memory caching to avoid repeated file I/O.
@@ -195,6 +269,15 @@ class KokoroV1(BaseModelBackend):
                 # ROCm reports device "cuda", so this is the ROCm path too.
                 _configure_rocm_backend()
                 self._model = self._model.cuda()
+                # Half the memory and 20-25% faster on an RTX 3060 Ti, and indistinguishable by ear.
+                # Generation runs under autocast, which keeps precision-sensitive ops in fp32.
+                # Older cards (Maxwell, Pascal) have no tensor cores and run fp16 far slower,
+                # and Triton, which torch.compile needs, doesn't support them.
+                self._half = torch.cuda.get_device_capability() >= (7, 0)
+                if self._half:
+                    self._model = self._model.half()
+                if self._half and not torch.version.hip:
+                    _compile(self._model)
             else:
                 self._model = self._model.cpu()
 
@@ -204,26 +287,9 @@ class KokoroV1(BaseModelBackend):
             raise RuntimeError(f"Failed to load Kokoro model: {e}")
 
     def _get_pipeline(self, lang_code: str) -> KPipeline:
-        """Get or create pipeline for language code.
-
-        Args:
-            lang_code: Language code to use
-
-        Returns:
-            KPipeline instance for the language
-        """
         if not self._model:
             raise RuntimeError("Model not loaded")
-
-        if lang_code not in self._pipelines:
-            logger.info(f"Creating new pipeline for language code: {lang_code}")
-            self._pipelines[lang_code] = KPipeline(
-                lang_code=lang_code,
-                repo_id=settings.model_repo_id,
-                model=self._model,
-                device=self._device,
-            )
-        return self._pipelines[lang_code]
+        return g2p.pipeline(lang_code)
 
     async def generate_from_tokens(
         self,
@@ -297,13 +363,16 @@ class KokoroV1(BaseModelBackend):
             )
             async for result in self._iterate_off_loop(
                 pipeline.generate_from_tokens(
-                    tokens=tokens, voice=voice_pack, speed=speed, model=self._model
+                    tokens=tokens,
+                    voice=voice_pack,
+                    speed=speed,
+                    model=self._locked_model,
                 )
             ):
                 if result.audio is not None:
                     logger.debug(f"Got audio chunk with shape: {result.audio.shape}")
                     yielded = True
-                    yield result.audio.numpy()
+                    yield result.audio.float().numpy()
                 else:
                     logger.warning("No audio in chunk")
 
@@ -325,9 +394,49 @@ class KokoroV1(BaseModelBackend):
                 return
             raise
 
+    def _render_stitched(self, phonemes: Phonemes, pack: torch.Tensor, speed: float):
+        """A clause too long for one chunk, rendered in overlapping pieces (see stitching.py).
+
+        Yields (audio, word timestamps) per piece; each next() is one model call.
+        """
+        ps = phonemes.phonemes
+        # The model silently drops phonemes outside its vocabulary (e.g. espeak's ¿ and ¡),
+        # which would shift every duration after them
+        kept = [i for i, c in enumerate(ps) if c in self._model.vocab]
+        rendered = set(kept)
+        spans = []
+        for word, first, last in _word_spans(phonemes):
+            inside = [i for i in range(first, last + 1) if i in rendered]
+            if inside:
+                spans.append((word, inside[0], inside[-1]))
+
+        def render(context, row):
+            out = self._locked_model(context, pack[row - 1], speed, return_output=True)
+            return out.audio.float().numpy(), out.pred_dur.numpy()
+
+        filtered = "".join(ps[i] for i in kept)
+        for audio, times in render_stitched(
+            filtered, settings.absolute_max_tokens, render
+        ):
+            times = {kept[i]: t for i, t in times.items()}
+            words = []
+            for word, first, last in spans:
+                if first not in times:
+                    continue
+                start = times[first][0]
+                end = times[last][1] if last in times else len(audio)
+                words.append(
+                    WordTimestamp(
+                        word=word,
+                        start_time=round(start / 24000, 3),
+                        end_time=round(end / 24000, 3),
+                    )
+                )
+            yield audio, words
+
     async def generate(
         self,
-        text: str,
+        phonemes: Phonemes,
         voice: Union[str, Tuple[str, Union[torch.Tensor, str]]],
         speed: float = 1.0,
         lang_code: Optional[str] = None,
@@ -337,7 +446,7 @@ class KokoroV1(BaseModelBackend):
         """Generate audio using model.
 
         Args:
-            text: Input text to synthesize
+            phonemes: Phonemized chunk to synthesize
             voice: Either a voice path string or a tuple of (voice_name, voice_tensor/path)
             speed: Speed multiplier
             lang_code: Optional language code override
@@ -395,10 +504,24 @@ class KokoroV1(BaseModelBackend):
             pipeline = self._get_pipeline(pipeline_lang_code)
 
             logger.debug(
-                f"Generating audio for text with lang_code '{pipeline_lang_code}': '{text[:100]}{'...' if len(text) > 100 else ''}'"
+                f"Generating audio with lang_code '{pipeline_lang_code}': '{phonemes.text[:100]}{'...' if len(phonemes.text) > 100 else ''}'"
             )
+            if len(phonemes.phonemes) > settings.absolute_max_tokens:
+                async for audio, words in self._iterate_off_loop(
+                    self._render_stitched(phonemes, voice_pack, speed)
+                ):
+                    yielded = True
+                    yield AudioChunk(
+                        audio, word_timestamps=words if return_timestamps else None
+                    )
+                return
             async for result in self._iterate_off_loop(
-                pipeline(text, voice=voice_pack, speed=speed, model=self._model)
+                pipeline.generate_from_tokens(
+                    tokens=phonemes.tokens or phonemes.phonemes,
+                    voice=voice_pack,
+                    speed=speed,
+                    model=self._locked_model,
+                )
             ):
                 if result.audio is not None:
                     logger.debug(f"Got audio chunk with shape: {result.audio.shape}")
@@ -465,15 +588,15 @@ class KokoroV1(BaseModelBackend):
                         ):
                             pred_dur = getattr(result.output, "pred_dur", None)
                         word_timestamps = _espeak_word_timestamps(
-                            result.graphemes,
+                            phonemes.text,
                             result.phonemes,
                             pred_dur,
-                            g2p=getattr(pipeline, "g2p", None),
+                            g2p=partial(g2p.raw, lang_code=pipeline_lang_code),
                         )
 
                     yielded = True
                     yield AudioChunk(
-                        result.audio.numpy(), word_timestamps=word_timestamps
+                        result.audio.float().numpy(), word_timestamps=word_timestamps
                     )
                 else:
                     logger.warning("No audio in chunk")
@@ -489,7 +612,12 @@ class KokoroV1(BaseModelBackend):
             ):
                 self._clear_memory()
                 async for chunk in self.generate(
-                    text, voice, speed, lang_code, return_timestamps, _retry_oom=False
+                    phonemes,
+                    voice,
+                    speed,
+                    lang_code,
+                    return_timestamps,
+                    _retry_oom=False,
                 ):
                     yield chunk
                 return
@@ -521,10 +649,10 @@ class KokoroV1(BaseModelBackend):
         if self._model is not None:
             del self._model
             self._model = None
-        for pipeline in self._pipelines.values():
-            del pipeline
-        self._pipelines.clear()
         self._voice_cache.clear()
+        # The compiled wrappers form reference cycles with the modules they wrap, so the
+        # weights would stay on the GPU until the next cyclic collection
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()

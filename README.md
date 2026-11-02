@@ -585,7 +585,7 @@ curl -s http://localhost:8880/dev/ssml -H "Content-Type: application/json" \
 - Automatically splits and stitches at sentence boundaries 
 - Reduces artifacts, and allows long-form output from a base model configured for roughly 30s at a time
 
-The model takes up to 510 phonemized tokens per chunk, but running it that long tends to produce 'rushed' speech and other artifacts. The server adds its own chunking layer on top, sized by `TARGET_MIN_TOKENS`, `TARGET_MAX_TOKENS`, and `ABSOLUTE_MAX_TOKENS` (175, 250, 450 by default, set via environment variables).
+The model takes up to 510 phonemized tokens per chunk, but running it that long tends to produce 'rushed' speech and other artifacts. The server generates one sentence per chunk, which also gets the first audio out sooner. A sentence longer than `ABSOLUTE_MAX_TOKENS` (450 phonemes by default) is split at its commas and other clause punctuation. A clause that's still too long is rendered in overlapping pieces of up to that size, each with the words around it, so the joins don't sound like pauses.
 
 </details>
 

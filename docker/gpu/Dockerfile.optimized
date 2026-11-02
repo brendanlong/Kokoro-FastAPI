@@ -40,9 +40,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Stage 2: Runtime - `base` variant: cudart + NVIDIA_* env only; torch uses its pip CUDA/cuDNN copies, system ones were dead weight (#482)
 FROM --platform=$BUILDPLATFORM nvcr.io/nvidia/cuda:${CUDA_VERSION}-base-ubuntu24.04
 
-# Install runtime dependencies
+# Install runtime dependencies. gcc and libc6-dev: Triton (for torch.compile) builds a small
+# launcher with the system C compiler the first time it runs.
 RUN apt-get update -y && \
-    apt-get install -y --no-install-recommends espeak-ng espeak-ng-data libsndfile1 curl && \
+    apt-get install -y --no-install-recommends espeak-ng espeak-ng-data libsndfile1 curl gcc libc6-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     mkdir -p /usr/share/espeak-ng-data && \
     ln -s /usr/lib/*/espeak-ng-data/* /usr/share/espeak-ng-data/ && \
