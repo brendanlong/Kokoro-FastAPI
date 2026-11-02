@@ -1388,7 +1388,7 @@ wheels = [
 [[package]]
 name = "kokoro"
 version = "0.9.4"
-source = { git = "https://github.com/brendanlong/kokoro?rev=50ea02a749f1913591f5b2aa673cd29ecc1bf49c#50ea02a749f1913591f5b2aa673cd29ecc1bf49c" }
+source = { git = "https://github.com/brendanlong/kokoro?rev=66c8ed5108f39470c75dff01280f9fc2c9ccd521#66c8ed5108f39470c75dff01280f9fc2c9ccd521" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "loguru" },
@@ -1492,7 +1492,7 @@ requires-dist = [
     { name = "inflect", specifier = ">=7.5.0" },
     { name = "inno-kokoro", specifier = "==0.2.0" },
     { name = "jinja2", marker = "extra == 'test'", specifier = ">=3.1.6" },
-    { name = "kokoro", git = "https://github.com/brendanlong/kokoro?rev=50ea02a749f1913591f5b2aa673cd29ecc1bf49c" },
+    { name = "kokoro", git = "https://github.com/brendanlong/kokoro?rev=66c8ed5108f39470c75dff01280f9fc2c9ccd521" },
     { name = "loguru", specifier = "==0.7.3" },
     { name = "misaki", extras = ["en", "ja", "ko", "zh"], specifier = "==0.9.4" },
     { name = "munch", specifier = "==4.0.0" },
